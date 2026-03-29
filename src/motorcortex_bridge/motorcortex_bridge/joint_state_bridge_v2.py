@@ -153,6 +153,14 @@ class JointStateBridgeV2(Node):
                     time.sleep(5)
                     continue
 
+                # ── 1.5단계: JogMode/PauseMode 설정 (mcx-client-app_v3.py startOp() 참조)
+                try:
+                    self._req.setParameter('root/MachineControl/gotoJogMode', True).get()
+                    self._req.setParameter('root/MachineControl/gotoPauseMode', False).get()
+                    self.get_logger().info('JogMode 활성 / PauseMode 해제 완료.')
+                except Exception as e:
+                    self.get_logger().warn(f'모드 설정 실패: {e}')
+
                 # ── 2단계: Homing (mcx-client-app_v3.py _homing() 참조) ─────
                 if self.enable_csp and not self._homing_axis1():
                     self.get_logger().error('Homing 실패 — 5초 후 재시도')
