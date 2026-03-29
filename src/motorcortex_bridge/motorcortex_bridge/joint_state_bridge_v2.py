@@ -69,7 +69,8 @@ JOINT_LOOP_MAP = [
     ('HL_joint6_toe_p',   '05'),
 ]
 BASE_PATH          = 'root/AxesControl/actuatorControlLoops/actuatorControlLoop'
-JOINT_TARGET_PATH  = 'root/MachineControl/jointPositionsTarget'   # 배열, rad
+# [쓰기] mcx-client-app_v3.py 동일 경로: additive offset(rad) → jointPositionsTarget → EtherCAT(0x607A)
+JOINT_TARGET_PATH  = 'root/MachineControl/hostInJointAdditivePosition1'
 
 def _param_path(loop_num: str, param_name: str) -> str:
     return f'{BASE_PATH}{loop_num}/{param_name}'
@@ -106,10 +107,9 @@ class JointStateBridgeV2(Node):
         self._positions_target   = {name: 0.0 for name, _ in JOINT_LOOP_MAP}
         self._lock               = threading.Lock()
 
-        self._joint_target_array = None   # jointPositionsTarget 배열 (rad)
-        self._axis1_center_rad   = 0.0
-        self._traj_start_time    = None
-        self._csp_ready          = False
+        self._home_offset      = 0.0    # homing 후 0점 기준 additive offset (v3 참조)
+        self._traj_start_time  = None
+        self._csp_ready        = False
 
         # ── Motorcortex 연결 ──────────────────────────────────────────────────
         self._req  = None
@@ -153,28 +153,16 @@ class JointStateBridgeV2(Node):
                     time.sleep(5)
                     continue
 
-                # ── 2단계: jointPositionsTarget 배열 초기 읽기 ───────────────
-                reply = self._req.getParameter(JOINT_TARGET_PATH).get()
-                if reply and reply.value:
-                    self._joint_target_array = list(reply.value)
-                    self.get_logger().info(
-                        f'jointPositionsTarget 배열 크기: {len(self._joint_target_array)}'
-                    )
-                else:
-                    self.get_logger().error('jointPositionsTarget 읽기 실패 — 5초 후 재시도')
-                    time.sleep(5)
-                    continue
-
-                # ── 3단계: Homing (mcx-client-app_v3.py _homing() 참조) ──────
+                # ── 2단계: Homing (mcx-client-app_v3.py _homing() 참조) ─────
                 if self.enable_csp and not self._homing_axis1():
                     self.get_logger().error('Homing 실패 — 5초 후 재시도')
                     time.sleep(5)
                     continue
 
-                # ── 4단계: CSP 궤적 준비 ─────────────────────────────────────
-                self._axis1_center_rad = 0.0   # homing 후 0° 기준
-                self._traj_start_time  = time.monotonic()
-                self._csp_ready        = True
+                # ── 3단계: CSP 궤적 준비 ─────────────────────────────────────
+                # _home_offset은 _homing_axis1()에서 설정됨 (v3의 home_offset 동일)
+                self._traj_start_time = time.monotonic()
+                self._csp_ready       = True
                 self.get_logger().info(
                     f'CSP 궤적 시작 — 0° 중심 ±{TRAJ_AMPLITUDE_DEG}° / {TRAJ_PERIOD_SEC}s'
                 )
@@ -212,9 +200,9 @@ class JointStateBridgeV2(Node):
         self.get_logger().error('Engage 타임아웃!')
         return False
 
-    # ── Homing 시퀀스 (mcx-client-app_v3.py _homing() 참조) ──────────────────
+    # ── Homing 시퀀스 (mcx-client-app_v3.py _homing() 동일 방식) ────────────
     def _homing_axis1(self) -> bool:
-        """1축 motorPositionActual을 읽어 0° 아니면 jointPositionsTarget[0]을 0으로 램프."""
+        """1축 motorPositionActual을 읽어 0° 아니면 additive offset 램프로 0°로 복귀."""
         try:
             # [읽기] EtherCAT(0x6064) → motorPositionActual(raw counts) → rad
             actual = self._req.getParameter(_param_path('01', 'motorPositionActual')).get()
@@ -230,31 +218,29 @@ class JointStateBridgeV2(Node):
 
         if abs(current_rad) <= HOMING_THRESHOLD_RAD:
             self.get_logger().info('홈 위치 이내, Homing 생략.')
+            self._req.setParameter(JOINT_TARGET_PATH, [0.0]).get()
+            self._home_offset = 0.0
             return True
 
         self.get_logger().info(
             f'Homing 시작: {math.degrees(current_rad):.2f}° → 0° ({HOMING_VEL_DEG_S}°/s)'
         )
 
-        # [쓰기] jointPositionsTarget[0]을 current_rad → 0으로 선형 램프
-        step = math.copysign(HOMING_VEL_RAD_S * HOMING_DT, -current_rad)
-        pos  = current_rad
-        while abs(pos) > abs(step):
-            pos += step
-            targets    = list(self._joint_target_array)
-            targets[0] = pos
+        # [쓰기] additive offset을 0 → -current_rad까지 램프 (v3 _homing() 동일)
+        target_offset = -current_rad
+        step   = math.copysign(HOMING_VEL_RAD_S * HOMING_DT, target_offset)
+        offset = 0.0
+        while abs(target_offset - offset) > abs(step):
+            offset += step
             try:
-                self._req.setParameter(JOINT_TARGET_PATH, targets).get()
+                self._req.setParameter(JOINT_TARGET_PATH, [offset]).get()
             except Exception as e:
                 self.get_logger().warn(f'Homing 쓰기 오류: {e}')
                 return False
             time.sleep(HOMING_DT)
 
-        # 최종 0° 전송
-        targets    = list(self._joint_target_array)
-        targets[0] = 0.0
-        self._req.setParameter(JOINT_TARGET_PATH, targets).get()
-        self._joint_target_array[0] = 0.0
+        self._req.setParameter(JOINT_TARGET_PATH, [target_offset]).get()
+        self._home_offset = target_offset   # 0점 기준 offset 저장 (v3 home_offset 동일)
         self.get_logger().info('Homing 완료 → 0°')
         return True
 
@@ -290,25 +276,21 @@ class JointStateBridgeV2(Node):
     def _send_csp_setpoint(self):
         if not self.enable_csp or self._req is None or not self._csp_ready:
             return
-        if self._joint_target_array is None:
-            return
 
-        elapsed    = time.monotonic() - self._traj_start_time
-        target_rad = (
-            self._axis1_center_rad
+        elapsed = time.monotonic() - self._traj_start_time
+        # [쓰기] v3 iterate()와 동일: home_offset 기준 ±AMPLITUDE 사인파 additive offset
+        offset_rad = (
+            self._home_offset
             + TRAJ_AMPLITUDE_RAD * math.sin(2.0 * math.pi * elapsed / TRAJ_PERIOD_SEC)
         )
 
-        # Rviz 목표 위치 저장
+        # RViz 목표 위치 저장 (actual에 offset 더해 절대 위치로 표시)
         with self._lock:
-            self._positions_target['HL_joint2_thigh_r'] = target_rad
+            self._positions_target['HL_joint2_thigh_r'] = offset_rad
 
-        # 배열 전체 복사 후 index 0 (1축)만 갱신하여 전송
-        targets    = list(self._joint_target_array)
-        targets[0] = target_rad
-
+        # [쓰기] hostInJointAdditivePosition1 에 scalar offset 전송 (v3 동일)
         try:
-            self._req.setParameter(JOINT_TARGET_PATH, targets)
+            self._req.setParameter(JOINT_TARGET_PATH, [offset_rad])
         except Exception as e:
             self.get_logger().warn(f'CSP 지령 오류: {e}', throttle_duration_sec=5.0)
 
@@ -317,18 +299,18 @@ class JointStateBridgeV2(Node):
         if self._req is None or not self._csp_ready:
             return
         try:
-            tgt   = self._req.getParameter(JOINT_TARGET_PATH).get()
-            act   = self._req.getParameter(_param_path('01', 'motorPositionActual')).get()
+            tgt = self._req.getParameter(JOINT_TARGET_PATH).get()
+            act = self._req.getParameter(_param_path('01', 'motorPositionActual')).get()
 
-            tgt_rad = float(tgt.value[0]) if tgt and tgt.value else float('nan')
-            act_cnt = float(act.value[0]) if act and act.value else float('nan')
-            act_rad = act_cnt * ENCODER_TO_RAD
+            # additive offset 값
+            tgt_offset = float(tgt.value[0]) if tgt and tgt.value else float('nan')
+            act_cnt    = float(act.value[0]) if act and act.value else float('nan')
+            act_rad    = act_cnt * ENCODER_TO_RAD
 
             self.get_logger().info(
                 f'[모니터] '
-                f'Target={math.degrees(tgt_rad):+.3f}°  '
-                f'Actual={math.degrees(act_rad):+.3f}°  '
-                f'Δ={math.degrees(tgt_rad - act_rad):+.3f}°'
+                f'AdditiveOffset={math.degrees(tgt_offset):+.3f}°  '
+                f'Actual={math.degrees(act_rad):+.3f}°'
             )
         except Exception as e:
             self.get_logger().warn(f'모니터 오류: {e}', throttle_duration_sec=5.0)
