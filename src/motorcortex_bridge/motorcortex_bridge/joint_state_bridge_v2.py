@@ -7,10 +7,18 @@ Motorcortex → ROS2 Joint State Bridge + CSP 1축 궤적 제어
   - /joint_states 퍼블리시 → Rviz 시각화
 
 [v2 추가]
+  - Engage 시퀀스 (mcx-client-app_v3.py 참조): 연결 후 상태머신 ENGAGED 진입
+  - Homing 시퀀스 (mcx-client-app_v3.py 참조): 1축을 0°로 램프 이동 후 궤적 시작
   - 1축 CSP 위치 제어: root/MachineControl/jointPositionsTarget (배열, rad)
-  - 궤적: 초기 위치 중심 ± 10° 사인파, 주기 4 s
+  - 궤적: 0° 중심 ± 10° 사인파, 주기 4 s
   - /target_joint_states 퍼블리시 → Rviz 목표 vs 실제 비교
   - 0.5 s 주기 Target/Actual 모니터 로그
+
+시작 시퀀스 (mcx-client-app_v3.py 참조):
+  1. Motorcortex 연결
+  2. Engage: stateCommand=2 → state==4(ENGAGED) 대기
+  3. Homing: motorPositionActual(enc→rad) 읽기 → jointPositionsTarget[0]을 0°로 램프
+  4. CSP 궤적 시작: 0° 중심 ±10° 사인파 → jointPositionsTarget[0]
 
 조인트 매핑:
   index 0 = HL_joint2_thigh_r  ← actuatorControlLoop01  ← 궤적 제어 축
@@ -32,6 +40,19 @@ import math
 # ── 엔코더 상수 (motorPositionActual 읽기 전용) ───────────────────────────────
 COUNTS_PER_REV = 4096
 ENCODER_TO_RAD = (2.0 * math.pi) / COUNTS_PER_REV
+
+# ── 상태머신 상수 (mcx-client-app_v3.py 참조) ────────────────────────────────
+STATE_CMD_PATH  = 'root/Logic/stateCommand'
+STATE_PATH      = 'root/Logic/state'
+ENGAGE_CMD      = 2       # GOTO_ENGAGED_E
+ENGAGED_STATE   = 4       # ENGAGED_S
+ENGAGE_TIMEOUT  = 10.0
+
+# ── 홈 복귀 파라미터 (mcx-client-app_v3.py 참조) ─────────────────────────────
+HOMING_THRESHOLD_RAD = math.radians(0.1)   # 0.1° 이내면 홈으로 간주
+HOMING_VEL_DEG_S     = 30.0               # 홈 복귀 속도 (°/s)
+HOMING_VEL_RAD_S     = math.radians(HOMING_VEL_DEG_S)
+HOMING_DT            = 0.001              # 1 ms step
 
 # ── 궤적 파라미터 ─────────────────────────────────────────────────────────────
 TRAJ_AMPLITUDE_DEG = 10.0
@@ -125,11 +146,117 @@ class JointStateBridgeV2(Node):
                     reconnect=True
                 )
                 self.get_logger().info('Motorcortex 연결 성공')
+
+                # ── 1단계: Engage (mcx-client-app_v3.py _engage() 참조) ──────
+                if not self._engage():
+                    self.get_logger().error('Engage 실패 — 5초 후 재시도')
+                    time.sleep(5)
+                    continue
+
+                # ── 2단계: jointPositionsTarget 배열 초기 읽기 ───────────────
+                reply = self._req.getParameter(JOINT_TARGET_PATH).get()
+                if reply and reply.value:
+                    self._joint_target_array = list(reply.value)
+                    self.get_logger().info(
+                        f'jointPositionsTarget 배열 크기: {len(self._joint_target_array)}'
+                    )
+                else:
+                    self.get_logger().error('jointPositionsTarget 읽기 실패 — 5초 후 재시도')
+                    time.sleep(5)
+                    continue
+
+                # ── 3단계: Homing (mcx-client-app_v3.py _homing() 참조) ──────
+                if self.enable_csp and not self._homing_axis1():
+                    self.get_logger().error('Homing 실패 — 5초 후 재시도')
+                    time.sleep(5)
+                    continue
+
+                # ── 4단계: CSP 궤적 준비 ─────────────────────────────────────
+                self._axis1_center_rad = 0.0   # homing 후 0° 기준
+                self._traj_start_time  = time.monotonic()
+                self._csp_ready        = True
+                self.get_logger().info(
+                    f'CSP 궤적 시작 — 0° 중심 ±{TRAJ_AMPLITUDE_DEG}° / {TRAJ_PERIOD_SEC}s'
+                )
+
                 self._subscribe_joints()
                 break
             except Exception as e:
                 self.get_logger().error(f'Motorcortex 연결 실패: {e} — 5초 후 재시도')
                 time.sleep(5)
+
+    # ── Engage 시퀀스 (mcx-client-app_v3.py _engage() 참조) ──────────────────
+    def _engage(self) -> bool:
+        try:
+            state = self._req.getParameter(STATE_PATH).get()
+            if state and state.value and state.value[0] == ENGAGED_STATE:
+                self.get_logger().info('이미 Engaged 상태.')
+                return True
+        except Exception:
+            pass
+
+        self.get_logger().info('Engage 명령 전송...')
+        self._req.setParameter(STATE_CMD_PATH, [ENGAGE_CMD]).get()
+
+        deadline = time.time() + ENGAGE_TIMEOUT
+        while time.time() < deadline:
+            try:
+                state = self._req.getParameter(STATE_PATH).get()
+                if state and state.value and state.value[0] == ENGAGED_STATE:
+                    self.get_logger().info('Engage 완료.')
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+        self.get_logger().error('Engage 타임아웃!')
+        return False
+
+    # ── Homing 시퀀스 (mcx-client-app_v3.py _homing() 참조) ──────────────────
+    def _homing_axis1(self) -> bool:
+        """1축 motorPositionActual을 읽어 0° 아니면 jointPositionsTarget[0]을 0으로 램프."""
+        try:
+            # [읽기] EtherCAT(0x6064) → motorPositionActual(raw counts) → rad
+            actual = self._req.getParameter(_param_path('01', 'motorPositionActual')).get()
+            if not actual or not actual.value:
+                self.get_logger().warn('1축 위치 읽기 실패, Homing 생략.')
+                return True
+            current_rad = float(actual.value[0]) * ENCODER_TO_RAD
+        except Exception as e:
+            self.get_logger().warn(f'1축 위치 읽기 오류: {e}, Homing 생략.')
+            return True
+
+        self.get_logger().info(f'1축 현재 위치: {math.degrees(current_rad):.2f}°')
+
+        if abs(current_rad) <= HOMING_THRESHOLD_RAD:
+            self.get_logger().info('홈 위치 이내, Homing 생략.')
+            return True
+
+        self.get_logger().info(
+            f'Homing 시작: {math.degrees(current_rad):.2f}° → 0° ({HOMING_VEL_DEG_S}°/s)'
+        )
+
+        # [쓰기] jointPositionsTarget[0]을 current_rad → 0으로 선형 램프
+        step = math.copysign(HOMING_VEL_RAD_S * HOMING_DT, -current_rad)
+        pos  = current_rad
+        while abs(pos) > abs(step):
+            pos += step
+            targets    = list(self._joint_target_array)
+            targets[0] = pos
+            try:
+                self._req.setParameter(JOINT_TARGET_PATH, targets).get()
+            except Exception as e:
+                self.get_logger().warn(f'Homing 쓰기 오류: {e}')
+                return False
+            time.sleep(HOMING_DT)
+
+        # 최종 0° 전송
+        targets    = list(self._joint_target_array)
+        targets[0] = 0.0
+        self._req.setParameter(JOINT_TARGET_PATH, targets).get()
+        self._joint_target_array[0] = 0.0
+        self.get_logger().info('Homing 완료 → 0°')
+        return True
 
     # ── 실제 관절 위치 구독 ───────────────────────────────────────────────────
     def _subscribe_joints(self):
@@ -149,24 +276,6 @@ class JointStateBridgeV2(Node):
                             self._positions_actual[joint_names[i]] = (
                                 float(param.value[0]) * ENCODER_TO_RAD
                             )
-
-                    # 초기화: jointPositionsTarget 배열에서 중심 위치 캡처
-                    if not self._csp_ready and self._req is not None:
-                        try:
-                            reply = self._req.getParameter(JOINT_TARGET_PATH).get()
-                            if reply and reply.value and len(reply.value) >= 1:
-                                self._joint_target_array = list(reply.value)
-                                self._axis1_center_rad   = self._joint_target_array[0]
-                                self._traj_start_time    = time.monotonic()
-                                self._csp_ready          = True
-                                self.get_logger().info(
-                                    f'1축 초기 위치 캡처 (jointPositionsTarget[0]): '
-                                    f'{math.degrees(self._axis1_center_rad):.3f} rad '
-                                    f'({math.degrees(self._axis1_center_rad):.2f}°) '
-                                    f'| 배열 크기: {len(self._joint_target_array)}'
-                                )
-                        except Exception as e:
-                            self.get_logger().warn(f'초기화 실패: {e}')
 
             subscription.notify(callback)
             self._mcx_subscriptions.append(subscription)
