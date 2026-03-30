@@ -109,8 +109,10 @@ class JointStateBridgeV2(Node):
         self._home_offset      = 0.0    # homing 후 0점 기준 additive offset (v3 참조)
         self._traj_start_time  = None
         self._csp_ready        = False
-        self._loop_count       = 0      # v3 iterate() 루프 카운터
-        self._last_iter        = 0.0    # v3 실제 주기 측정용
+        self._loop_count       = 0      # 전체 루프 카운터
+        self._last_iter        = 0.0    # 직전 루프 시각 (v3 참조)
+        self._hz_last_log_time = 0.0    # 1초 Hz 로그 기준 시각
+        self._hz_period_count  = 0      # 1초 내 루프 횟수
 
         # ── Motorcortex 연결 ──────────────────────────────────────────────────
         self._req  = None
@@ -294,15 +296,23 @@ class JointStateBridgeV2(Node):
                 continue
 
             now = time.perf_counter()
-            self._loop_count += 1
+            self._loop_count      += 1
+            self._hz_period_count += 1
 
-            # v3 iterate()와 동일: 1000루프마다 실제 Hz 출력
+            # 1초마다 실제 루프 주파수 출력 (v3 iterate() 참조, 시간 기반)
             if self._last_iter > 0.0:
                 dt = now - self._last_iter
-                if self._loop_count % 1000 == 0:
-                    self.get_logger().info(
-                        f'[CSP루프] 실제 주기: {dt*1000:.2f} ms  ({1.0/dt:.0f} Hz)'
-                    )
+                if self._hz_last_log_time > 0.0:
+                    elapsed_log = now - self._hz_last_log_time
+                    if elapsed_log >= 1.0:
+                        avg_hz = self._hz_period_count / elapsed_log
+                        self.get_logger().info(
+                            f'[루프] 실제 주기: {1000.0/avg_hz:.2f} ms  ({avg_hz:.0f} Hz)'
+                        )
+                        self._hz_last_log_time = now
+                        self._hz_period_count  = 0
+                else:
+                    self._hz_last_log_time = now
             self._last_iter = now
 
             elapsed = time.monotonic() - self._traj_start_time
