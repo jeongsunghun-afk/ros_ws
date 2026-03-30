@@ -60,6 +60,9 @@ TRAJ_AMPLITUDE_RAD = math.radians(TRAJ_AMPLITUDE_DEG)
 TRAJ_PERIOD_SEC    = 4.0
 CYCLE_TIME         = 0.001    # 1 ms → 1 kHz (v3 CYCLE_TIME 동일)
 
+# CSP 루프 안에서 퍼블리시 주기 (매 N회 → 1kHz/5 = 200 Hz)
+PUB_DIVIDER        = 5
+
 # ── Motorcortex 파라미터 경로 ─────────────────────────────────────────────────
 JOINT_LOOP_MAP = [
     ('HL_joint2_thigh_r', '01'),
@@ -100,7 +103,7 @@ class JointStateBridgeV2(Node):
         # ── ROS2 퍼블리셔 & 타이머 ───────────────────────────────────────────
         self._pub_actual  = self.create_publisher(JointState, '/joint_states',        10)
         self._pub_target  = self.create_publisher(JointState, '/target_joint_states', 10)
-        self._pub_timer    = self.create_timer(1.0 / publish_rate, self._publish_joint_states)
+        # _publish_joint_states는 CSP 루프에서 직접 호출 (타이머 제거)
         self._verify_timer = self.create_timer(0.5,                self._log_target_verify)
 
         # ── 상태 변수 ─────────────────────────────────────────────────────────
@@ -115,6 +118,7 @@ class JointStateBridgeV2(Node):
         self._last_iter        = 0.0    # 직전 루프 시각 (v3 참조)
         self._hz_last_log_time = 0.0    # 1초 Hz 로그 기준 시각
         self._hz_period_count  = 0      # 1초 내 루프 횟수
+        self._pub_ctr          = 0      # CSP 루프 내 퍼블리시 카운터
 
         # ── Motorcortex 연결 ──────────────────────────────────────────────────
         self._req  = None
@@ -335,6 +339,12 @@ class JointStateBridgeV2(Node):
                 self._req.setParameter(JOINT_TARGET_PATH, [offset_rad])
             except Exception as e:
                 self.get_logger().warn(f'CSP 지령 오류: {e}', throttle_duration_sec=5.0)
+
+            # CSP 루프에서 직접 퍼블리시 (타이머 대비 지연 없음, PUB_DIVIDER회마다 1번)
+            self._pub_ctr += 1
+            if self._pub_ctr >= PUB_DIVIDER:
+                self._pub_ctr = 0
+                self._publish_joint_states()
 
             time.sleep(CYCLE_TIME)   # 1 ms → 1 kHz 목표 (v3 CYCLE_TIME 동일)
 
