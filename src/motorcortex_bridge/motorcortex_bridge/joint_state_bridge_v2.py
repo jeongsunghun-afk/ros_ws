@@ -31,6 +31,7 @@ Motorcortex → ROS2 Joint State Bridge + CSP 1축 궤적 제어
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from builtin_interfaces.msg import Time as TimeMsg
 
 import motorcortex
 import threading
@@ -371,7 +372,10 @@ class JointStateBridgeV2(Node):
 
     # ── /joint_states 퍼블리시 ────────────────────────────────────────────────
     def _publish_joint_states(self):
-        now = self.get_clock().now().to_msg()
+        # 백그라운드 스레드에서 get_clock()은 미세한 비단조성 발생 가능
+        # → time.time_ns() 로 직접 구성하면 항상 단조 증가 보장
+        ns = time.time_ns()
+        now = TimeMsg(sec=ns // 10**9, nanosec=ns % 10**9)
 
         actual_msg = JointState()
         actual_msg.header.stamp    = now
