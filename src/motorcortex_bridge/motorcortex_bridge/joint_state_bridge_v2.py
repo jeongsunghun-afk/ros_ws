@@ -69,6 +69,8 @@ JOINT_LOOP_MAP = [
     ('HL_joint6_toe_p',   '05'),
 ]
 BASE_PATH          = 'root/AxesControl/actuatorControlLoops/actuatorControlLoop'
+# [읽기] EtherCAT(0x6064) → motorPositionActual(raw enc counts) — v3 ACTUAL_PATH 동일
+ACTUAL_PATH        = f'{BASE_PATH}01/motorPositionActual'
 # [쓰기] mcx-client-app_v3.py 동일 경로: additive offset(rad) → jointPositionsTarget → EtherCAT(0x607A)
 JOINT_TARGET_PATH  = 'root/MachineControl/hostInJointAdditivePosition1'
 
@@ -216,18 +218,18 @@ class JointStateBridgeV2(Node):
         self.get_logger().error('Engage 타임아웃!')
         return False
 
-    # ── Homing 시퀀스 (mcx-client-app_v3.py _homing() 동일 방식) ────────────
+    # ── Homing 시퀀스 (클로즈드루프: motorPositionActual → 0) ────────────────
     def _homing_axis1(self) -> bool:
-        """1축 motorPositionActual을 읽어 0° 아니면 additive offset 램프로 0°로 복귀."""
-        try:
-            # [읽기] EtherCAT(0x6064) → motorPositionActual(raw counts) → rad
-            actual = self._req.getParameter(_param_path('01', 'motorPositionActual')).get()
-            if not actual or not actual.value:
-                self.get_logger().warn('1축 위치 읽기 실패, Homing 생략.')
-                return True
-            current_rad = float(actual.value[0]) * ENCODER_TO_RAD
-        except Exception as e:
-            self.get_logger().warn(f'1축 위치 읽기 오류: {e}, Homing 생략.')
+        """ACTUAL_PATH를 매 스텝마다 읽어 motorPositionActual이 0°가 될 때까지 additive 조정."""
+        def _read_actual():
+            reply = self._req.getParameter(ACTUAL_PATH).get()
+            if not reply or not reply.value:
+                return None
+            return float(reply.value[0]) * ENCODER_TO_RAD
+
+        current_rad = _read_actual()
+        if current_rad is None:
+            self.get_logger().warn('1축 위치 읽기 실패, Homing 생략.')
             return True
 
         self.get_logger().info(f'1축 현재 위치: {math.degrees(current_rad):.2f}°')
@@ -242,11 +244,10 @@ class JointStateBridgeV2(Node):
             f'Homing 시작: {math.degrees(current_rad):.2f}° → 0° ({HOMING_VEL_DEG_S}°/s)'
         )
 
-        # [쓰기] additive offset을 0 → -current_rad까지 램프 (v3 _homing() 동일)
-        target_offset = -current_rad
-        step   = math.copysign(HOMING_VEL_RAD_S * HOMING_DT, target_offset)
+        # [클로즈드루프] 매 스텝 ACTUAL_PATH를 읽어 motorPositionActual → 0°
         offset = 0.0
-        while abs(target_offset - offset) > abs(step):
+        while abs(current_rad) > HOMING_THRESHOLD_RAD:
+            step   = math.copysign(HOMING_VEL_RAD_S * HOMING_DT, -current_rad)
             offset += step
             try:
                 self._req.setParameter(JOINT_TARGET_PATH, [offset]).get()
@@ -254,9 +255,12 @@ class JointStateBridgeV2(Node):
                 self.get_logger().warn(f'Homing 쓰기 오류: {e}')
                 return False
             time.sleep(HOMING_DT)
+            val = _read_actual()
+            if val is not None:
+                current_rad = val   # 실제 위치 갱신 → 클로즈드루프
 
-        self._req.setParameter(JOINT_TARGET_PATH, [target_offset]).get()
-        self._home_offset = target_offset   # 0점 기준 offset 저장 (v3 home_offset 동일)
+        self._req.setParameter(JOINT_TARGET_PATH, [offset]).get()
+        self._home_offset = 0.0   # motorPositionActual = 0 도달, offset 기준도 0
         self.get_logger().info('Homing 완료 → 0°')
         return True
 
@@ -339,7 +343,7 @@ class JointStateBridgeV2(Node):
             return
         try:
             tgt = self._req.getParameter(JOINT_TARGET_PATH).get()
-            act = self._req.getParameter(_param_path('01', 'motorPositionActual')).get()
+            act = self._req.getParameter(ACTUAL_PATH).get()
 
             # additive offset 값
             tgt_offset = float(tgt.value[0]) if tgt and tgt.value else float('nan')
