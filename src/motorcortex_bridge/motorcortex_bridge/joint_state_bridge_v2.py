@@ -168,7 +168,9 @@ class JointStateBridgeV2(Node):
                     continue
 
                 # ── 3단계: CSP 궤적 준비 ─────────────────────────────────────
-                # _home_offset은 _homing_axis1()에서 설정됨 (v3의 home_offset 동일)
+                # Engage 후 SetpointGenerator가 0°로 리셋되므로
+                # additive는 0° 기준 절대값으로 동작함 → home_offset = 0
+                self._home_offset     = 0.0
                 self._traj_start_time = time.monotonic()
                 self._csp_ready       = True
                 self.get_logger().info(
