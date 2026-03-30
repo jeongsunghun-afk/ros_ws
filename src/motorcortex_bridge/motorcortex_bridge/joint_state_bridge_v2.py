@@ -58,7 +58,7 @@ HOMING_DT            = 0.001              # 1 ms step
 TRAJ_AMPLITUDE_DEG = 10.0
 TRAJ_AMPLITUDE_RAD = math.radians(TRAJ_AMPLITUDE_DEG)
 TRAJ_PERIOD_SEC    = 4.0
-TRAJ_RATE_HZ       = 100.0
+CYCLE_TIME         = 0.001    # 1 ms → 1 kHz (v3 CYCLE_TIME 동일)
 
 # ── Motorcortex 파라미터 경로 ─────────────────────────────────────────────────
 JOINT_LOOP_MAP = [
@@ -99,8 +99,7 @@ class JointStateBridgeV2(Node):
         self._pub_actual  = self.create_publisher(JointState, '/joint_states',        10)
         self._pub_target  = self.create_publisher(JointState, '/target_joint_states', 10)
         self._pub_timer    = self.create_timer(1.0 / publish_rate, self._publish_joint_states)
-        self._traj_timer   = self.create_timer(1.0 / TRAJ_RATE_HZ, self._send_csp_setpoint)
-        self._verify_timer = self.create_timer(0.5,                 self._log_target_verify)
+        self._verify_timer = self.create_timer(0.5,                self._log_target_verify)
 
         # ── 상태 변수 ─────────────────────────────────────────────────────────
         self._positions_actual   = {name: 0.0 for name, _ in JOINT_LOOP_MAP}
@@ -110,10 +109,15 @@ class JointStateBridgeV2(Node):
         self._home_offset      = 0.0    # homing 후 0점 기준 additive offset (v3 참조)
         self._traj_start_time  = None
         self._csp_ready        = False
+        self._loop_count       = 0      # v3 iterate() 루프 카운터
+        self._last_iter        = 0.0    # v3 실제 주기 측정용
 
         # ── Motorcortex 연결 ──────────────────────────────────────────────────
         self._req  = None
         self._sub  = None
+        # CSP 전송 전용 스레드 (v3 iterate() 방식: time.sleep(CYCLE_TIME) → 1 kHz 목표)
+        self._csp_thread = threading.Thread(target=self._csp_loop, daemon=True)
+        self._csp_thread.start()
         self._mcx_subscriptions = []
         self._connect_thread = threading.Thread(
             target=self._connect_motorcortex, daemon=True
@@ -282,27 +286,42 @@ class JointStateBridgeV2(Node):
         except Exception as e:
             self.get_logger().error(f'구독 오류: {e}')
 
-    # ── CSP 위치 지령 전송 (100 Hz) ───────────────────────────────────────────
-    def _send_csp_setpoint(self):
-        if not self.enable_csp or self._req is None or not self._csp_ready:
-            return
+    # ── CSP 전송 루프 (전용 스레드, v3 iterate() 동일 방식) ──────────────────
+    def _csp_loop(self):
+        while rclpy.ok():
+            if not self.enable_csp or self._req is None or not self._csp_ready:
+                time.sleep(0.01)
+                continue
 
-        elapsed = time.monotonic() - self._traj_start_time
-        # [쓰기] v3 iterate()와 동일: home_offset 기준 ±AMPLITUDE 사인파 additive offset
-        offset_rad = (
-            self._home_offset
-            + TRAJ_AMPLITUDE_RAD * math.sin(2.0 * math.pi * elapsed / TRAJ_PERIOD_SEC)
-        )
+            now = time.perf_counter()
+            self._loop_count += 1
 
-        # RViz 목표 위치 저장 (actual에 offset 더해 절대 위치로 표시)
-        with self._lock:
-            self._positions_target['HL_joint2_thigh_r'] = offset_rad
+            # v3 iterate()와 동일: 1000루프마다 실제 Hz 출력
+            if self._last_iter > 0.0:
+                dt = now - self._last_iter
+                if self._loop_count % 1000 == 0:
+                    self.get_logger().info(
+                        f'[CSP루프] 실제 주기: {dt*1000:.2f} ms  ({1.0/dt:.0f} Hz)'
+                    )
+            self._last_iter = now
 
-        # [쓰기] hostInJointAdditivePosition1 에 scalar offset 전송 (v3 동일)
-        try:
-            self._req.setParameter(JOINT_TARGET_PATH, [offset_rad])
-        except Exception as e:
-            self.get_logger().warn(f'CSP 지령 오류: {e}', throttle_duration_sec=5.0)
+            elapsed = time.monotonic() - self._traj_start_time
+            # [쓰기] v3 iterate()와 동일: home_offset 기준 ±AMPLITUDE 사인파 additive offset
+            offset_rad = (
+                self._home_offset
+                + TRAJ_AMPLITUDE_RAD * math.sin(2.0 * math.pi * elapsed / TRAJ_PERIOD_SEC)
+            )
+
+            with self._lock:
+                self._positions_target['HL_joint2_thigh_r'] = offset_rad
+
+            # [쓰기] hostInJointAdditivePosition1 에 scalar offset 전송 (v3 동일)
+            try:
+                self._req.setParameter(JOINT_TARGET_PATH, [offset_rad])
+            except Exception as e:
+                self.get_logger().warn(f'CSP 지령 오류: {e}', throttle_duration_sec=5.0)
+
+            time.sleep(CYCLE_TIME)   # 1 ms → 1 kHz 목표 (v3 CYCLE_TIME 동일)
 
     # ── Target / Actual 모니터 로그 (0.5 s) ──────────────────────────────────
     def _log_target_verify(self):
