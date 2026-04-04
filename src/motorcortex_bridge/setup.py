@@ -23,8 +23,7 @@ setup(
     license='BSD',
     entry_points={
         'console_scripts': [
-            'joint_state_bridge    = motorcortex_bridge.joint_state_bridge:main',
-            'joint_state_bridge_v2 = motorcortex_bridge.joint_state_bridge_v2:main',
+            'joint_state_bridge = motorcortex_bridge.joint_state_bridge:main',
         ],
     },
 )
