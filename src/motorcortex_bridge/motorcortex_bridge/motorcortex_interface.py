@@ -86,7 +86,6 @@ OFFSET_PATHS = [
     f'{BASE_PATH}{loop}/positionTransformation/transducer/offset'
     for _, loop in JOINT_LOOP_MAP[:N_AXES]
 ]
-ACTUAL_POS_PATH = 'root/AxesControl/actuatorControlLoops/actuatorPositionsActual'
 
 
 # ── 모드별 인코더 상수 ──────────────────────────────────────────────────────────
@@ -131,6 +130,7 @@ class MotorcortexInterface:
         self._actual_pos_rad   = [0.0] * len(JOINT_LOOP_MAP)   # 전체 조인트 (5개)
         self._actual_vel_rad   = [0.0] * len(JOINT_LOOP_MAP)   # rad/s (미지원 시 0)
         self._actual_torque_nm = [0.0] * N_AXES                 # Nm (ch0~ch3)
+        self._last_target_rad  = [0.0] * N_AXES                 # 마지막 전송 target (모니터용)
 
         # prod 모드 전용: homing 후 각 축의 additive 기준값 (비활성화)
         # self._home_offsets: list[float] = [0.0] * N_AXES
@@ -211,6 +211,8 @@ class MotorcortexInterface:
         for i in range(min(N_AXES, len(positions_rad))):
             ticks = int(round(positions_rad[i] / self._enc_to_rad))
             futures.append(self._req.setParameter(TARGET_PATHS[i], [ticks]))
+        with self._lock:
+            self._last_target_rad = list(positions_rad[:N_AXES])
 
         if blocking:
             for f in futures:
@@ -236,17 +238,21 @@ class MotorcortexInterface:
 
     def get_actual_positions_snapshot(self) -> list:
         """
-        actuatorPositionsActual 경로에서 현재 실제 위치 읽기 [rad].
+        ACTUAL_PATHS (per-axis motorPositionActual) 에서 현재 실제 위치 읽기 [rad].
         초기 last_cmd_pos 설정용 (구독 콜백 대신 1회성 폴링).
-        실패 시 [0.0] * N_AXES 반환.
+        실패한 축은 0.0 반환.
         """
-        try:
-            result = self._req.getParameter(ACTUAL_POS_PATH).get()
-            if result and result.value and len(result.value) >= N_AXES:
-                return [float(result.value[i]) * self._enc_to_rad for i in range(N_AXES)]
-        except Exception:
-            pass
-        return [0.0] * N_AXES
+        positions = []
+        for path in ACTUAL_PATHS[:N_AXES]:
+            try:
+                result = self._req.getParameter(path).get()
+                if result and result.value:
+                    positions.append(float(result.value[0]) * self._enc_to_rad)
+                else:
+                    positions.append(0.0)
+            except Exception:
+                positions.append(0.0)
+        return positions
 
     def get_target_positions(self) -> list:
         """현재 목표 위치 [rad] 읽기 (각 축 개별 폴링)."""
@@ -269,7 +275,7 @@ class MotorcortexInterface:
         ch0~ch3 의 motorTorqueActual 구독.
         콜백에서 _actual_pos_rad, _actual_torque_nm 갱신.
         """
-        sub_pos = self._sub.subscribe(ACTUAL_PATHS, 'pos_group', frq_divider=2)
+        sub_pos = self._sub.subscribe(ACTUAL_PATHS, 'pos_group', frq_divider=1)
 
         def _cb_pos(msg):
             with self._lock:
@@ -280,7 +286,7 @@ class MotorcortexInterface:
         sub_pos.notify(_cb_pos)
         self._subs.append(sub_pos)
 
-        sub_torque = self._sub.subscribe(TORQUE_ACTUAL_PATHS, 'torque_group', frq_divider=2)
+        sub_torque = self._sub.subscribe(TORQUE_ACTUAL_PATHS, 'torque_group', frq_divider=1)
 
         def _cb_torque(msg):
             with self._lock:
@@ -392,14 +398,10 @@ class MotorcortexInterface:
 
     def get_monitor_snapshot(self) -> list:
         """
-        모니터 로그용: [(tgt_rad, act_rad), ...] for ch0~ch3
+        모니터 로그용: [(tgt_rad, act_rad), ...] for ch0~ch3.
+        캐시된 값만 사용 — 블로킹 없음.
+        tgt는 마지막으로 전송한 명령 위치 (_last_target_rad).
         """
-        tgt_positions = self.get_target_positions()
-
-        rows = []
-        for i in range(N_AXES):
-            tgt_rad = tgt_positions[i] if i < len(tgt_positions) else 0.0
-            with self._lock:
-                act_rad = self._actual_pos_rad[i]
-            rows.append((tgt_rad, act_rad))
-        return rows
+        with self._lock:
+            return [(self._last_target_rad[i], self._actual_pos_rad[i])
+                    for i in range(N_AXES)]
