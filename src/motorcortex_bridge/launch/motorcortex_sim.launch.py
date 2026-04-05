@@ -9,9 +9,6 @@ Motorcortex + 시뮬레이터 통합 런치 파일
   mcx_cert:=/path/to/cert.crt     (인증서 경로, 선택)
   mcx_login:=admin
   mcx_password:=vectioneer
-  mcx_mode:=sim                   (기본: 시뮬레이션 모드)
-                                   sim  — Simulator/targetPosition, 인코더 1,048,576
-                                   prod — hostInJointAdditivePosition1, 인코더 4,096
   traj_file:=/home/jsh/leg_sim/trajectory_jump.txt
   traj_dt:=0.02                   (waypoint 간격 [s], 기본 50Hz)
   use_rviz:=true                  (true: RViz2 실행 / false: Isaac Sim 연결 모드)
@@ -49,10 +46,6 @@ def generate_launch_description():
     declare_mcx_password = DeclareLaunchArgument(
         'mcx_password', default_value='vectioneer',
         description='Motorcortex 비밀번호'
-    )
-    declare_mcx_mode = DeclareLaunchArgument(
-        'mcx_mode', default_value='sim',
-        description="sim=시뮬레이션(기본) / prod=실제 모터 제어"
     )
     declare_traj_file = DeclareLaunchArgument(
         'traj_file', default_value='/home/jsh/leg_sim/trajectory_jump.txt',
@@ -96,7 +89,6 @@ def generate_launch_description():
             'mcx_cert':     LaunchConfiguration('mcx_cert'),
             'mcx_login':    LaunchConfiguration('mcx_login'),
             'mcx_password': LaunchConfiguration('mcx_password'),
-            'mcx_mode':     LaunchConfiguration('mcx_mode'),
             'traj_file':    LaunchConfiguration('traj_file'),
             'traj_dt':      LaunchConfiguration('traj_dt'),
         }],
@@ -121,7 +113,6 @@ def generate_launch_description():
         declare_mcx_cert,
         declare_mcx_login,
         declare_mcx_password,
-        declare_mcx_mode,
         declare_traj_file,
         declare_traj_dt,
         declare_use_rviz,

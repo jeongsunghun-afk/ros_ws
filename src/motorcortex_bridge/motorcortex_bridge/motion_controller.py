@@ -115,6 +115,10 @@ class MotionController:
         self._cmd_kd  = [0.5]  * N_AXES
         self._cmd_tau = [0.0]  * N_AXES
 
+        # jump / home 이벤트
+        self._jump_event = threading.Event()
+        self._home_event = threading.Event()
+
         # 보간 루프 스레드 시작
         self._interp_thread = threading.Thread(target=self._interp_loop, daemon=True)
         self._interp_thread.start()
@@ -181,6 +185,54 @@ class MotionController:
     #         return True
     #     except Exception:
     #         return False
+
+    # ── jump / home 이벤트 루프 시작 ──────────────────────────────────────────
+    def start(self, log_cb=None) -> int:
+        """
+        궤적 로드 + jumpmode/homemode 구독 + 이벤트 루프 스레드 시작.
+        연결 완료 후 1회 호출.
+        반환: waypoint 수
+        """
+        waypoints = load_trajectory(self.traj_file)
+        self._waypoints = waypoints
+
+        self._mcx.subscribe_jumpmode(self._on_jump)
+        self._mcx.subscribe_homemode(self._on_home)
+
+        self._event_thread = threading.Thread(
+            target=self._event_loop, args=(log_cb,), daemon=True
+        )
+        self._event_thread.start()
+
+        return len(waypoints)
+
+    def _on_jump(self):
+        self._jump_event.set()
+
+    def _on_home(self):
+        self._home_event.set()
+
+    def _event_loop(self, log_cb=None):
+        while True:
+            jump_triggered = self._jump_event.wait(timeout=0.1)
+
+            if jump_triggered:
+                self._jump_event.clear()
+                self._mcx.reset_jumpmode()
+                if log_cb:
+                    log_cb('점프 궤적 실행')
+                self.move_l(self._waypoints, log_cb=log_cb)
+                if log_cb:
+                    log_cb('moveL 완료. 다음 점프 대기 중...')
+
+            if self._home_event.is_set():
+                self._home_event.clear()
+                if log_cb:
+                    log_cb('홈 복귀 실행')
+                self.move_to_home(log_cb=log_cb)
+                self._mcx.reset_homemode()
+                if log_cb:
+                    log_cb('홈 복귀 완료')
 
     # ── 궤적 실행 ─────────────────────────────────────────────────────────────
     def load_trajectory(self) -> list:

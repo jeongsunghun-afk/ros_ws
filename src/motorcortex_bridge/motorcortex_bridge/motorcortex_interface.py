@@ -3,14 +3,10 @@ motorcortex_interface.py
 MCX-OS 와의 저수준 통신 전담 클래스
 ROS2 의존성 없음 — motion_controller 또는 단독으로 사용 가능
 
-모드:
-  'sim'  — Simulator/targetPosition (절대 ticks), 인코더 1,048,576 (2^20)
-  'prod' — hostInJointAdditivePosition1 (additive rad), 인코더 4,096
-
 담당:
   - WebSocket(WSS) 연결 / 재연결
   - disableDrive, Engage, JogMode 시퀀스
-  - targetPosition / additive 쓰기
+  - targetPosition 쓰기
   - motorPositionActual 구독  (ticks → rad)
   - jumpmode 구독 (인터럽트 콜백)
 """
@@ -27,7 +23,6 @@ ENGAGE_CMD         = 2      # GOTO_ENGAGED_E
 ENGAGED_STATE      = 4      # ENGAGED_S
 ENGAGE_TIMEOUT     = 10.0
 
-PROD_TARGET_PATH   = 'root/MachineControl/hostInJointAdditivePosition1'  # prod 모드 쓰기
 DISABLE_DRIVE_PATH = 'root/DriveLogic/disableDrive'
 DISABLE_CH_IDX     = [4, 5]
 JUMP_MODE_PATH     = 'root/UserParameters/jumpmode'
@@ -88,39 +83,24 @@ OFFSET_PATHS = [
 ]
 
 
-# ── 모드별 인코더 상수 ──────────────────────────────────────────────────────────
-_COUNTS_PER_REV = {
-    'sim':  1048576,   # 2^20 (20-bit 시뮬레이터)
-    'prod': 4096,      # 실제 EtherCAT 모터 인코더
-}
-
-# ── Production 홈 복귀 파라미터 (비활성화) ────────────────────────────────────
-# HOMING_THRESHOLD_RAD = math.radians(0.1)
-# HOMING_VEL_RAD_S     = math.radians(30.0)
-# HOMING_CYCLE_TIME    = 0.001
+# ── 인코더 상수 ────────────────────────────────────────────────────────────────
+COUNTS_PER_REV = 1048576   # 2^20 (20-bit 시뮬레이터)
+# COUNTS_PER_REV = 4096    # 실제 EtherCAT 모터 인코더
 
 
 class MotorcortexInterface:
     """
     MCX-OS 통신 래퍼.
-
-    mode='sim'  : Simulator/targetPosition에 절대 ticks 전송 (기본)
-    mode='prod' : hostInJointAdditivePosition1에 additive rad 전송.
-                  prod 모드에서는 home_production() 호출 후 set_target_positions() 사용.
-
-    connect() 호출 후 setup_drives() → subscribe_positions() → subscribe_jumpmode() 순서로 초기화.
+    connect() 호출 후 disable_drives() → engage() → set_jog_mode() → subscribe_positions() 순서로 초기화.
     """
 
-    def __init__(self, url: str, cert: str, login: str, password: str, mode: str = 'sim'):
-        assert mode in ('sim', 'prod'), f"mode는 'sim' 또는 'prod'여야 합니다: {mode}"
-        self._mode     = mode
+    def __init__(self, url: str, cert: str, login: str, password: str):
         self._url      = url
         self._cert     = cert or '/home/jsh/mcx-client-app-template/mcx.cert.crt'
         self._login    = login
         self._password = password
 
-        self._counts_per_rev = _COUNTS_PER_REV[mode]
-        self._enc_to_rad     = (2.0 * math.pi) / self._counts_per_rev
+        self._enc_to_rad = (2.0 * math.pi) / COUNTS_PER_REV
 
         self._req  = None
         self._sub  = None
@@ -132,8 +112,6 @@ class MotorcortexInterface:
         self._actual_torque_nm = [0.0] * N_AXES                 # Nm (ch0~ch3)
         self._last_target_rad  = [0.0] * N_AXES                 # 마지막 전송 target (모니터용)
 
-        # prod 모드 전용: homing 후 각 축의 additive 기준값 (비활성화)
-        # self._home_offsets: list[float] = [0.0] * N_AXES
 
     @property
     def mode(self) -> str:
@@ -195,10 +173,6 @@ class MotorcortexInterface:
         """JogMode 활성, PauseMode 해제."""
         self._req.setParameter('root/MachineControl/gotoJogMode',  True).get()
         self._req.setParameter('root/MachineControl/gotoPauseMode', False).get()
-
-    # ── Production 홈 복귀 (비활성화) ────────────────────────────────────────
-    # def home_production(self, axis_is_real: list = None) -> bool: ...
-    # def _read_actual_prod(self, axis: int) -> float | None: ...
 
     # ── 위치 명령 ─────────────────────────────────────────────────────────────
     def set_target_positions(self, positions_rad: list, blocking: bool = False):
