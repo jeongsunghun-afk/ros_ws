@@ -110,9 +110,6 @@ class JointStateBridge(Node):
                 self._mcx.connect()
                 self.get_logger().info('연결 성공')
 
-                self._mcx.disable_drives()
-                self.get_logger().info('disableDrive 완료')
-
                 if not self._mcx.engage():
                     self.get_logger().error('Engage 실패 — 재시도')
                     time.sleep(5)
@@ -121,6 +118,9 @@ class JointStateBridge(Node):
 
                 self._mcx.set_jog_mode()
                 self.get_logger().info('JogMode 활성')
+
+                ticks = self._mcx.read_encoder_resolution()
+                self.get_logger().info(f'인코더 분해능: {ticks:.0f} ticks/rev')
 
                 self._mcx.subscribe_positions()
                 self._mcx.subscribe_control_mode(self._on_control_mode)

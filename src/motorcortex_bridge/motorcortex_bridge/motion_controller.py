@@ -45,8 +45,55 @@ TRAJ_FILE_DEFAULT  = '/home/jsh/leg_sim/trajectory_jump.txt'
 TRAJ_DT_DEFAULT    = 0.005    # 200 Hz
 CMD_PERIOD         = 0.02    # 외부 명령 수신 주기 [s] (tracking 모드 기준, 50 Hz)
 HOLD_CYCLE         = 0.005   # 200 Hz (보간 루프 주기)
-HOME_DURATION      = 3.0     # 홈 복귀 소요 시간 [s]
-HOME_THRESHOLD_RAD = math.radians(0.1)  # 홈 판정 임계값 (0.1°)
+HOME_THRESHOLD_RAD = math.radians(0.1)   # 홈 판정 임계값 (0.1°)
+HOME_MAX_VEL       = math.radians(60.0)  # 홈 복귀 최대 각속도 [rad/s] (60°/s)
+HOME_MAX_ACC       = math.radians(30.0)  # 홈 복귀 최대 각가속도 [rad/s²] (30°/s²)
+
+
+def trapezoid_profile(dist: float, max_vel: float, max_acc: float, dt: float) -> list:
+    """
+    단일 축 사다리꼴 속도 프로파일 생성.
+    dist     : 이동 거리 (양수)
+    max_vel  : 최대 속도 [단위/s]
+    max_acc  : 최대 가속도 [단위/s²]
+    dt       : 샘플 주기 [s]
+    반환     : 각 스텝의 누적 이동량 리스트 (0 → dist)
+    """
+    d_acc = max_vel ** 2 / (2.0 * max_acc)
+
+    if 2.0 * d_acc >= dist:
+        # 삼각형 프로파일 (최대 속도 도달 전에 감속 시작)
+        v_peak  = math.sqrt(max_acc * dist)
+        t_acc   = v_peak / max_acc
+        t_total = 2.0 * t_acc
+    else:
+        # 사다리꼴 프로파일
+        t_acc   = max_vel / max_acc
+        t_const = (dist - 2.0 * d_acc) / max_vel
+        t_total = 2.0 * t_acc + t_const
+        v_peak  = max_vel
+
+    n_steps = max(1, int(t_total / dt))
+    positions = []
+    for k in range(1, n_steps + 1):
+        t = t_total * k / n_steps
+        if 2.0 * d_acc >= dist:
+            t_acc_loc = v_peak / max_acc
+            if t <= t_acc_loc:
+                p = 0.5 * max_acc * t ** 2
+            else:
+                t2 = t - t_acc_loc
+                p = 0.5 * max_acc * t_acc_loc ** 2 + v_peak * t2 - 0.5 * max_acc * t2 ** 2
+        else:
+            if t <= t_acc:
+                p = 0.5 * max_acc * t ** 2
+            elif t <= t_acc + t_const:
+                p = d_acc + max_vel * (t - t_acc)
+            else:
+                t3 = t - t_acc - t_const
+                p = d_acc + max_vel * t_const + max_vel * t3 - 0.5 * max_acc * t3 ** 2
+        positions.append(min(p, dist))
+    return positions
 
 
 def load_trajectory(filepath: str) -> list:
@@ -287,10 +334,17 @@ class MotionController:
             log_cb('moveL 완료 — interp loop 재개.')
 
     # ── 홈 복귀 궤적 ─────────────────────────────────────────────────────────────
-    def move_to_home(self, log_cb=None):
+    def move_to_home(self, max_vel: float = HOME_MAX_VEL,
+                     max_acc: float = HOME_MAX_ACC, log_cb=None):
         """
-        현재 actual 위치 → [0, 0, 0, 0] 선형 궤적 생성 후 실행 (blocking).
-        모든 축이 이미 HOME_THRESHOLD_RAD 이내이면 즉시 반환.
+        현재 actual 위치 → [0, 0, 0, 0] 사다리꼴 속도 프로파일 궤적 실행 (blocking).
+        가장 많이 움직이는 축 기준으로 시간이 결정되고, 나머지 축은 비례 스케일.
+        모든 축이 HOME_THRESHOLD_RAD 이내이면 즉시 반환.
+
+        Parameters
+        ----------
+        max_vel : 최대 각속도 [rad/s]  (기본 HOME_MAX_VEL = 60°/s)
+        max_acc : 최대 각가속도 [rad/s²] (기본 HOME_MAX_ACC = 30°/s²)
         """
         current = self._mcx.actual_positions[:N_AXES]
 
@@ -299,15 +353,25 @@ class MotionController:
                 log_cb('홈 복귀: 이미 홈 위치 — 스킵.')
             return
 
-        n_steps = max(1, int(HOME_DURATION / self.traj_dt))
+        # 가장 큰 이동 거리 축 기준 사다리꼴 프로파일 생성
+        max_dist = max(abs(p) for p in current)
+        profile  = trapezoid_profile(max_dist, max_vel, max_acc, self.traj_dt)
+        n_steps  = len(profile)
+
+        # 각 축을 거리에 비례하여 스케일
         waypoints = [
-            tuple(current[i] * (1.0 - step / n_steps) for i in range(N_AXES))
-            for step in range(1, n_steps + 1)
+            tuple(
+                current[i] * (1.0 - profile[k] / max_dist)
+                for i in range(N_AXES)
+            )
+            for k in range(n_steps)
         ]
 
+        t_total = n_steps * self.traj_dt
         if log_cb:
             log_cb(
-                f'홈 복귀 시작: {n_steps} steps / {HOME_DURATION:.1f}s  '
+                f'홈 복귀 시작: {n_steps} steps / {t_total:.2f}s '
+                f'(max_vel={math.degrees(max_vel):.0f}°/s, max_acc={math.degrees(max_acc):.0f}°/s²)  '
                 + ', '.join(f'j{i+1}={math.degrees(current[i]):+.1f}°→0°'
                             for i in range(N_AXES))
             )

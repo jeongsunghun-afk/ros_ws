@@ -5,10 +5,10 @@ ROS2 의존성 없음 — motion_controller 또는 단독으로 사용 가능
 
 담당:
   - WebSocket(WSS) 연결 / 재연결
-  - disableDrive, Engage, JogMode 시퀀스
+  - Engage, JogMode 시퀀스
   - targetPosition 쓰기
   - motorPositionActual 구독  (ticks → rad)
-  - jumpmode 구독 (인터럽트 콜백)
+  - jumpmode / homemode / controlMode 구독 (인터럽트 콜백)
 """
 
 import motorcortex
@@ -19,35 +19,29 @@ import math
 # ── MCX 파라미터 경로 ──────────────────────────────────────────────────────────
 STATE_CMD_PATH     = 'root/Logic/stateCommand'
 STATE_PATH         = 'root/Logic/state'
+IS_ENGAGED_PATH    = 'root/Logic/:ctrlToState/isAtEngaged'
 ENGAGE_CMD         = 2      # GOTO_ENGAGED_E
 ENGAGED_STATE      = 4      # ENGAGED_S
 ENGAGE_TIMEOUT     = 10.0
 
-DISABLE_DRIVE_PATH = 'root/DriveLogic/disableDrive'
-DISABLE_CH_IDX     = [4, 5]
 JUMP_MODE_PATH     = 'root/UserParameters/jumpmode'
 HOME_MODE_PATH     = 'root/UserParameters/homemode'
 CONTROL_MODE_PATH  = 'root/UserParameters/controlMode'
 POSITION_MODE_PATH = 'root/UserParameters/positionMode'
 
 # ── 제어 모드 값 (controlMode) ─────────────────────────────────────────────────
-#   1 = mpc      (내부 MPC 계산)
-#   2 = tracking (외부 RL 명령 추종)
-#   그 외 → 0 = standby (위치 유지)
-CTRL_MODE_STANDBY  = 0
-CTRL_MODE_MPC      = 1
-CTRL_MODE_TRACKING = 2
+CTRL_MODE_STANDBY  = 0 # swing leg - 정해진 궤적을 따라 발을 원하는 위치로 정확하게 이동시킴 
+CTRL_MODE_MPC      = 1 # stance leg - 지면에 닿아 로봇의 몸체를 지탱하고 CoM의 안정적인 동역학 구현 목표 속도 추종
+CTRL_MODE_TRACKING = 2 # RL control
 
 # ── 위치 모드 값 (positionMode) ────────────────────────────────────────────────
-#   0 = position (moveJ / moveL 궤적 제어)
-#   1 = force    (force control)
-#   그 외 → 0 = position
-POS_MODE_POSITION = 0
-POS_MODE_FORCE    = 1
+POS_MODE_POSITION = 0 #moveJ, moveL // waypoint 입력
+POS_MODE_FORCE    = 1 #Impedance control // 힘/토크 입력
+POS_MODE_TRJECTORY = 2 #Jump, gait // 궤적실행
 
 BASE_PATH = 'root/AxesControl/actuatorControlLoops/actuatorControlLoop'
 
-# ── 조인트 매핑: (ROS joint name, loop suffix, channel index) ──────────────────
+# ── 조인트 매핑: (ROS joint name, loop suffix) ────────────────────────────────
 #   ch0 = HL_joint2_thigh_r  ← actuatorControlLoop01
 #   ch1 = HL_joint3_thigh_p  ← actuatorControlLoop02
 #   ch2 = HL_joint4_knee_p   ← actuatorControlLoop03
@@ -62,36 +56,48 @@ JOINT_LOOP_MAP = [
     ('HL_joint6_toe_p',   '05'),
 ]
 ACTUAL_PATHS = [
-    f'root/AxesControl/actuatorControlLoops/actuatorControlLoop{i:02d}/motorPositionActual'
-    for i in range(1, len(JOINT_LOOP_MAP) + 1)
+    f'{BASE_PATH}{loop}/motorPositionActual'
+    for _, loop in JOINT_LOOP_MAP
 ]
 TORQUE_ACTUAL_PATHS = [
-    f'root/AxesControl/actuatorControlLoops/actuatorControlLoop{i:02d}/motorTorqueActual'
-    for i in range(1, N_AXES + 1)
+    f'{BASE_PATH}{loop}/motorTorqueActual'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
 ]
 TARGET_PATHS = [
-    f'root/AxesControl/actuatorControlLoops/actuatorControlLoop{i:02d}/motorPositionTarget'
-    for i in range(1, N_AXES + 1)
+    f'{BASE_PATH}{loop}/motorPositionTarget'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
 ]
 TORQUE_TARGET_PATHS = [
-    f'root/AxesControl/actuatorControlLoops/actuatorControlLoop{i:02d}/motorTorqueTarget'
-    for i in range(1, N_AXES + 1)
+    f'{BASE_PATH}{loop}/motorTorqueTarget'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
+]
+VELOCITY_ACTUAL_PATHS = [
+    f'{BASE_PATH}{loop}/motorVelocityActual'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
+]
+VELOCITY_TARGET_PATHS = [
+    f'{BASE_PATH}{loop}/motorVelocityTarget'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
+]
+TORQUE_OFFSET_TARGET_PATHS = [
+    f'{BASE_PATH}{loop}/motorTorqueOffsetTarget'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
 ]
 OFFSET_PATHS = [
     f'{BASE_PATH}{loop}/positionTransformation/transducer/offset'
     for _, loop in JOINT_LOOP_MAP[:N_AXES]
 ]
-
-
-# ── 인코더 상수 ────────────────────────────────────────────────────────────────
-COUNTS_PER_REV = 1048576   # 2^20 (20-bit 시뮬레이터)
-# COUNTS_PER_REV = 4096    # 실제 EtherCAT 모터 인코더
+TICKS_PER_REV_PATHS = [
+    f'{BASE_PATH}{loop}/positionTransformation/transducer/ticksPerRevolution'
+    for _, loop in JOINT_LOOP_MAP[:N_AXES]
+]
 
 
 class MotorcortexInterface:
     """
     MCX-OS 통신 래퍼.
-    connect() 호출 후 disable_drives() → engage() → set_jog_mode() → subscribe_positions() 순서로 초기화.
+    connect() 후 engage() → set_jog_mode() → read_encoder_resolution() → subscribe_positions() 순서로 초기화.
+    인코더 분해능은 connect 후 MCX에서 직접 읽어옴 (ticksPerRevolution).
     """
 
     def __init__(self, url: str, cert: str, login: str, password: str):
@@ -100,22 +106,17 @@ class MotorcortexInterface:
         self._login    = login
         self._password = password
 
-        self._enc_to_rad = (2.0 * math.pi) / COUNTS_PER_REV
+        self._enc_to_rad = None   # connect 후 read_encoder_resolution()으로 설정
 
         self._req  = None
         self._sub  = None
-        self._subs = []          # 등록된 MCX subscription 목록 (cleanup용)
+        self._subs = []
 
         self._lock             = threading.Lock()
-        self._actual_pos_rad   = [0.0] * len(JOINT_LOOP_MAP)   # 전체 조인트 (5개)
-        self._actual_vel_rad   = [0.0] * len(JOINT_LOOP_MAP)   # rad/s (미지원 시 0)
-        self._actual_torque_nm = [0.0] * N_AXES                 # Nm (ch0~ch3)
-        self._last_target_rad  = [0.0] * N_AXES                 # 마지막 전송 target (모니터용)
-
-
-    @property
-    def mode(self) -> str:
-        return self._mode
+        self._actual_pos_rad   = [0.0] * len(JOINT_LOOP_MAP)
+        self._actual_vel_rad   = [0.0] * len(JOINT_LOOP_MAP)
+        self._actual_torque_nm = [0.0] * N_AXES
+        self._last_target_rad  = [0.0] * N_AXES
 
     # ── 연결 ─────────────────────────────────────────────────────────────────
     def connect(self, timeout_ms: int = 5000) -> bool:
@@ -145,15 +146,22 @@ class MotorcortexInterface:
     def is_connected(self) -> bool:
         return self._req is not None
 
-    # ── 드라이브 초기화 시퀀스 ─────────────────────────────────────────────
-    def disable_drives(self, channels: list = None):
-        """지정 채널 disableDrive=True (기본: ch4, ch5)."""
-        channels = channels if channels is not None else DISABLE_CH_IDX
-        arr = [False] * (max(channels) + 1 if channels else 6)
-        for ch in channels:
-            arr[ch] = True
-        self._req.setParameter(DISABLE_DRIVE_PATH, arr).get()
+    # ── 인코더 분해능 읽기 ────────────────────────────────────────────────────
+    def read_encoder_resolution(self) -> float:
+        """
+        ch0 의 ticksPerRevolution 을 읽어 _enc_to_rad 설정.
+        모든 축이 동일한 인코더를 사용한다고 가정.
+        반환: ticks_per_rev (float)
+        """
+        result = self._req.getParameter(TICKS_PER_REV_PATHS[0]).get()
+        if result and result.value:
+            ticks_per_rev = float(result.value[0])
+        else:
+            raise RuntimeError('ticksPerRevolution 읽기 실패')
+        self._enc_to_rad = (2.0 * math.pi) / ticks_per_rev
+        return ticks_per_rev
 
+    # ── Engage / JogMode ──────────────────────────────────────────────────────
     def engage(self, timeout: float = ENGAGE_TIMEOUT) -> bool:
         """Engage 상태 진입. 이미 Engaged면 즉시 True 반환."""
         result = self._req.getParameter(STATE_PATH).get()
@@ -179,7 +187,6 @@ class MotorcortexInterface:
         """
         ch0~ch3 에 목표 위치 명령 전송.
         positions_rad: N_AXES 길이의 절대 위치 리스트 [rad]
-        각 축을 TARGET_PATHS[i] 에 개별 전송 (ticks 변환).
         """
         futures = []
         for i in range(min(N_AXES, len(positions_rad))):
@@ -187,17 +194,12 @@ class MotorcortexInterface:
             futures.append(self._req.setParameter(TARGET_PATHS[i], [ticks]))
         with self._lock:
             self._last_target_rad = list(positions_rad[:N_AXES])
-
         if blocking:
             for f in futures:
                 f.get()
 
     def get_joint_offsets(self) -> list:
-        """
-        각 축의 positionTransformation/transducer/offset 값 읽기 [rad].
-        MCX에 저장된 joint offset을 초기 위치 기준값으로 사용.
-        실패한 축은 0.0 으로 반환.
-        """
+        """각 축의 positionTransformation/transducer/offset 값 읽기 [rad]."""
         offsets = []
         for path in OFFSET_PATHS:
             try:
@@ -211,11 +213,7 @@ class MotorcortexInterface:
         return offsets
 
     def get_actual_positions_snapshot(self) -> list:
-        """
-        ACTUAL_PATHS (per-axis motorPositionActual) 에서 현재 실제 위치 읽기 [rad].
-        초기 last_cmd_pos 설정용 (구독 콜백 대신 1회성 폴링).
-        실패한 축은 0.0 반환.
-        """
+        """현재 실제 위치 읽기 [rad] — 초기값 설정용 1회성 폴링."""
         positions = []
         for path in ACTUAL_PATHS[:N_AXES]:
             try:
@@ -229,7 +227,7 @@ class MotorcortexInterface:
         return positions
 
     def get_target_positions(self) -> list:
-        """현재 목표 위치 [rad] 읽기 (각 축 개별 폴링)."""
+        """현재 목표 위치 [rad] 읽기."""
         positions = []
         for path in TARGET_PATHS:
             try:
@@ -244,11 +242,7 @@ class MotorcortexInterface:
 
     # ── 구독 ─────────────────────────────────────────────────────────────────
     def subscribe_positions(self):
-        """
-        모든 조인트(5개)의 motorPositionActual 구독.
-        ch0~ch3 의 motorTorqueActual 구독.
-        콜백에서 _actual_pos_rad, _actual_torque_nm 갱신.
-        """
+        """모든 조인트의 motorPositionActual 및 ch0~ch3 motorTorqueActual 구독."""
         sub_pos = self._sub.subscribe(ACTUAL_PATHS, 'pos_group', frq_divider=1)
 
         def _cb_pos(msg):
@@ -272,10 +266,6 @@ class MotorcortexInterface:
         self._subs.append(sub_torque)
 
     def subscribe_jumpmode(self, on_jump: callable):
-        """
-        jumpmode 파라미터 구독.
-        값이 1 이 되면 on_jump() 콜백 호출.
-        """
         sub = self._sub.subscribe([JUMP_MODE_PATH], 'jump_group', frq_divider=1)
 
         def _cb(msg):
@@ -289,10 +279,6 @@ class MotorcortexInterface:
         self._req.setParameter(JUMP_MODE_PATH, [0]).get()
 
     def subscribe_homemode(self, on_home: callable):
-        """
-        homemode 파라미터 구독.
-        값이 1 이 되면 on_home() 콜백 호출.
-        """
         sub = self._sub.subscribe([HOME_MODE_PATH], 'home_group', frq_divider=1)
 
         def _cb(msg):
@@ -306,11 +292,6 @@ class MotorcortexInterface:
         self._req.setParameter(HOME_MODE_PATH, [0]).get()
 
     def subscribe_control_mode(self, on_mode_change: callable):
-        """
-        controlMode 파라미터 구독.
-        값이 변경되면 on_mode_change(mode: int) 콜백 호출.
-        1=tracking, 2=mpc, 그 외=0(standby)로 정규화하여 전달.
-        """
         sub = self._sub.subscribe([CONTROL_MODE_PATH], 'ctrl_mode_group', frq_divider=1)
 
         def _cb(msg):
@@ -323,11 +304,6 @@ class MotorcortexInterface:
         self._subs.append(sub)
 
     def subscribe_position_mode(self, on_mode_change: callable):
-        """
-        positionMode 파라미터 구독.
-        값이 변경되면 on_mode_change(mode: int) 콜백 호출.
-        0=position(moveJ/moveL), 1=force, 그 외=0(position)으로 정규화하여 전달.
-        """
         sub = self._sub.subscribe([POSITION_MODE_PATH], 'pos_mode_group', frq_divider=1)
 
         def _cb(msg):
@@ -342,27 +318,20 @@ class MotorcortexInterface:
     # ── 상태 읽기 ─────────────────────────────────────────────────────────────
     @property
     def actual_positions(self) -> list:
-        """모든 조인트 실제 위치 [rad] (len = len(JOINT_LOOP_MAP))."""
         with self._lock:
             return list(self._actual_pos_rad)
 
     @property
     def actual_velocities(self) -> list:
-        """모든 조인트 실제 속도 [rad/s] (현재 미지원 → 0)."""
         with self._lock:
             return list(self._actual_vel_rad)
 
     @property
     def actual_torques(self) -> list:
-        """ch0~ch3 실제 토크 [Nm]."""
         with self._lock:
             return list(self._actual_torque_nm)
 
     def set_torque_targets(self, torques_nm: list, blocking: bool = False):
-        """
-        ch0~ch3 에 목표 토크 명령 전송 [Nm].
-        torques_nm: N_AXES 길이의 토크 리스트
-        """
         futures = []
         for i in range(min(N_AXES, len(torques_nm))):
             futures.append(self._req.setParameter(TORQUE_TARGET_PATHS[i], [torques_nm[i]]))
@@ -371,11 +340,7 @@ class MotorcortexInterface:
                 f.get()
 
     def get_monitor_snapshot(self) -> list:
-        """
-        모니터 로그용: [(tgt_rad, act_rad), ...] for ch0~ch3.
-        캐시된 값만 사용 — 블로킹 없음.
-        tgt는 마지막으로 전송한 명령 위치 (_last_target_rad).
-        """
+        """모니터 로그용: [(tgt_rad, act_rad), ...] for ch0~ch3. 캐시만 사용."""
         with self._lock:
             return [(self._last_target_rad[i], self._actual_pos_rad[i])
                     for i in range(N_AXES)]
