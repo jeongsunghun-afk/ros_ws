@@ -34,10 +34,10 @@ CTRL_MODE_STANDBY  = 0 # swing leg - 정해진 궤적을 따라 발을 원하는
 CTRL_MODE_MPC      = 1 # stance leg - 지면에 닿아 로봇의 몸체를 지탱하고 CoM의 안정적인 동역학 구현 목표 속도 추종
 CTRL_MODE_TRACKING = 2 # RL control
 
-# ── 위치 모드 값 (positionMode) ────────────────────────────────────────────────
-POS_MODE_POSITION = 0 #moveJ, moveL // waypoint 입력
-POS_MODE_FORCE    = 1 #Impedance control // 힘/토크 입력
-POS_MODE_TRJECTORY = 2 #Jump, gait // 궤적실행
+# ── 테스트 모드 값 (TestMode) ────────────────────────────────────────────────
+TEST_MODE_POSITION = 0 #moveJ, moveL // waypoint 입력
+TEST_MODE_FORCE    = 1 #Impedance control // 힘/토크 입력
+TEST_MODE_Trajectory = 2 #Jump, gait // .txt 궤적실행 or 궤적생성값 입력
 
 BASE_PATH = 'root/AxesControl/actuatorControlLoops/actuatorControlLoop'
 
@@ -303,13 +303,13 @@ class MotorcortexInterface:
         sub.notify(_cb)
         self._subs.append(sub)
 
-    def subscribe_position_mode(self, on_mode_change: callable):
+    def subscribe_test_mode(self, on_mode_change: callable):
         sub = self._sub.subscribe([POSITION_MODE_PATH], 'pos_mode_group', frq_divider=1)
 
         def _cb(msg):
             if msg and msg[0].value:
                 raw = int(msg[0].value[0])
-                mode = raw if raw in (POS_MODE_POSITION, POS_MODE_FORCE) else POS_MODE_POSITION
+                mode = raw if raw in (TEST_MODE_POSITION, TEST_MODE_FORCE, TEST_MODE_Trajectory) else TEST_MODE_POSITION
                 on_mode_change(mode)
 
         sub.notify(_cb)

@@ -31,8 +31,9 @@ from motorcortex_bridge.motorcortex_interface import (
     CTRL_MODE_STANDBY,
     CTRL_MODE_TRACKING,
     CTRL_MODE_MPC,
-    POS_MODE_POSITION,
-    POS_MODE_FORCE,
+    TEST_MODE_POSITION,
+    TEST_MODE_FORCE,
+    TEST_MODE_Trajectory,
 )
 
 # ── 홈 자세 ────────────────────────────────────────────────────────────────────
@@ -146,7 +147,7 @@ class MotionController:
 
         # 위치 모드 (GRID positionMode 동기화)
         # 0=position(moveJ/moveL), 1=force
-        self._pos_mode = POS_MODE_POSITION
+        self._pos_mode = TEST_MODE_POSITION
 
         # 마지막 명령 위치 (standby / publish 참조용)
         self._last_cmd_pos = list(Q_HOME_RAD)
@@ -195,18 +196,18 @@ class MotionController:
         with self._lock:
             self._ctrl_mode = mode
 
-    def set_position_mode(self, mode: int):
+    def set_test_mode(self, mode: int):
         """
-        GRID positionMode 값으로 위치 모드 전환.
-        0=position(moveJ/moveL), 1=force, 그 외 → 0(position).
+        GRID positionMode 값으로 테스트 모드 전환.
+        0=position(moveJ/moveL), 1=force, 2=trajectory, 그 외 → 0(position).
         """
-        if mode not in (POS_MODE_POSITION, POS_MODE_FORCE):
-            mode = POS_MODE_POSITION
+        if mode not in (TEST_MODE_POSITION, TEST_MODE_FORCE, TEST_MODE_Trajectory):
+            mode = TEST_MODE_POSITION
         with self._lock:
             self._pos_mode = mode
 
     @property
-    def pos_mode(self) -> int:
+    def test_mode(self) -> int:
         return self._pos_mode
 
     # ── 초기 위치 설정 (MCX joint offset 기준) ───────────────────────────────
