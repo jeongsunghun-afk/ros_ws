@@ -66,7 +66,7 @@ class JointStateBridge(Node):
         traj_dt      = self.get_parameter('traj_dt').value
 
         # ── 모듈 초기화 ───────────────────────────────────────────────────
-        self._mcx  = MotorcortexInterface(mcx_url, mcx_cert, mcx_login, mcx_password)
+        self._mcx = MotorcortexInterface(mcx_url, mcx_cert, mcx_login, mcx_password)
         self._ctrl = MotionController(self._mcx, traj_file, traj_dt)
 
         # ── ROS2 퍼블리셔 ─────────────────────────────────────────────────
@@ -116,8 +116,8 @@ class JointStateBridge(Node):
                     continue
                 self.get_logger().info('Engaged')
 
-                self._mcx.set_jog_mode()
-                self.get_logger().info('JogMode 활성')
+                # self._mcx.set_jog_mode()  # MCX 시작 시 자동 적용 (services_config.json)
+                # self.get_logger().info('JogMode 활성')
 
                 ticks = self._mcx.read_encoder_resolution()
                 self.get_logger().info(f'인코더 분해능: {ticks:.0f} ticks/rev')

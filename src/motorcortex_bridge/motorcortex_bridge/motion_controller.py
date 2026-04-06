@@ -221,19 +221,6 @@ class MotionController:
             self._interp_prev   = list(positions[:N_AXES])
             self._interp_target = list(positions[:N_AXES])
 
-    # ── 시뮬레이터 홈 초기화 (비활성화) ─────────────────────────────────────
-    # def home(self) -> bool:
-    #     """ch0~ch3 을 Q_HOME 으로 이동 (blocking)."""
-    #     try:
-    #         self._mcx.set_target_positions(Q_HOME_RAD, blocking=True)
-    #         with self._lock:
-    #             self._last_cmd_pos  = list(Q_HOME_RAD)
-    #             self._interp_prev   = list(Q_HOME_RAD)
-    #             self._interp_target = list(Q_HOME_RAD)
-    #         return True
-    #     except Exception:
-    #         return False
-
     # ── jump / home 이벤트 루프 시작 ──────────────────────────────────────────
     def start(self, log_cb=None) -> int:
         """
@@ -347,7 +334,7 @@ class MotionController:
         max_vel : 최대 각속도 [rad/s]  (기본 HOME_MAX_VEL = 60°/s)
         max_acc : 최대 각가속도 [rad/s²] (기본 HOME_MAX_ACC = 30°/s²)
         """
-        current = self._mcx.actual_positions[:N_AXES]
+        current = self._mcx.get_actual_positions_snapshot()
 
         if all(abs(p) < HOME_THRESHOLD_RAD for p in current):
             if log_cb:
