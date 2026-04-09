@@ -119,9 +119,6 @@ class JointStateBridge(Node):
                 # self._mcx.set_jog_mode()  # MCX 시작 시 자동 적용 (services_config.json)
                 # self.get_logger().info('JogMode 활성')
 
-                ticks = self._mcx.read_encoder_resolution()
-                self.get_logger().info(f'인코더 분해능: {ticks:.0f} ticks/rev')
-
                 self._mcx.subscribe_positions()
                 self._mcx.subscribe_control_mode(self._on_control_mode)
 
@@ -183,7 +180,6 @@ class JointStateBridge(Node):
         now = TimeMsg(sec=ns // 10**9, nanosec=ns % 10**9)
 
         actual_pos = self._mcx.actual_positions
-        actual_vel = self._mcx.actual_velocities
 
         # ── /joint_states (RViz) ─────────────────────────────────────────
         js = JointState()
@@ -192,7 +188,7 @@ class JointStateBridge(Node):
         for i, (name, _) in enumerate(JOINT_LOOP_MAP):
             js.name.append(name)
             js.position.append(actual_pos[i])
-            js.velocity.append(actual_vel[i])
+            js.velocity.append(0.0)
             js.effort.append(0.0)
         self._pub_joint.publish(js)
         self._pub_count += 1
@@ -204,7 +200,7 @@ class JointStateBridge(Node):
         for i in range(N_AXES):
             ls.name.append(JOINT_LOOP_MAP[i][0])
             ls.position.append(actual_pos[i])
-            ls.velocity.append(actual_vel[i])
+            ls.velocity.append(0.0)
             ls.effort.append(0.0)
         self._pub_state.publish(ls)
 
@@ -220,7 +216,7 @@ class JointStateBridge(Node):
         self._pub_rate_last = now
 
         try:
-            rows = self._mcx.get_monitor_snapshot()
+            rows = self._ctrl.get_monitor_snapshot()
         except Exception:
             return
 

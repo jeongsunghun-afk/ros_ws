@@ -440,3 +440,9 @@ class MotionController:
                 pass
 
             time.sleep(HOLD_CYCLE)
+
+    def get_monitor_snapshot(self) -> list:
+        """모니터 로그용: [(tgt_rad, act_rad), ...] for ch0~ch3."""
+        actual = self._mcx.actual_positions
+        with self._lock:
+            return [(self._last_cmd_pos[i], actual[i]) for i in range(N_AXES)]
