@@ -242,7 +242,9 @@ class MotionController:
         return len(waypoints)
 
     def _on_jump(self):
-        self._jump_event.set()
+        # move_l 실행 중에는 추가 발화 무시 (이중 실행 방지)
+        if not self._in_movel:
+            self._jump_event.set()
 
     def _on_home(self):
         self._home_event.set()
@@ -252,8 +254,10 @@ class MotionController:
             jump_triggered = self._jump_event.wait(timeout=0.1)
 
             if jump_triggered:
+                self._in_movel = True        # 즉시 잠금: reset 완료 전 콜백 재발화 차단
                 self._jump_event.clear()
-                self._mcx.reset_jumpmode()
+                self._mcx.reset_jumpmode()   # blocking — MCX jumpmode=0 확정 후 복귀
+                self._jump_event.clear()     # reset 완료 후 재발화된 이벤트 제거
                 if log_cb:
                     log_cb('점프 궤적 실행')
                 self.move_l(self._waypoints, log_cb=log_cb)
