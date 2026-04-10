@@ -372,7 +372,7 @@ class MotionController:
                 self._jump_event.clear()     # reset 완료 후 재발화된 이벤트 제거
                 if log_cb:
                     log_cb('점프 궤적 실행')
-                self.move_j(self._waypoints, log_cb=log_cb)
+                self._send_waypoints(self._waypoints, self.traj_dt, 'moveJ(txt)', log_cb)
                 if log_cb:
                     log_cb('moveL 완료. 다음 점프 대기 중...')
 
