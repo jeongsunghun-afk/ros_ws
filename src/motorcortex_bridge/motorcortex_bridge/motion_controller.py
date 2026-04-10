@@ -371,10 +371,10 @@ class MotionController:
                 self._mcx.reset_jumpmode()   # blocking — MCX jumpmode=0 확정 후 복귀
                 self._jump_event.clear()     # reset 완료 후 재발화된 이벤트 제거
                 if log_cb:
-                    log_cb('점프 궤적 실행')
+                    log_cb('점프 궤적 실행 (moveJ txt)')
                 self._send_waypoints(self._waypoints, self.traj_dt, 'moveJ(txt)', log_cb)
                 if log_cb:
-                    log_cb('moveL 완료. 다음 점프 대기 중...')
+                    log_cb('moveJ(txt) 완료. 다음 점프 대기 중...')
 
             if self._home_event.is_set():
                 self._home_event.clear()
