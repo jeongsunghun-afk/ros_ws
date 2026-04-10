@@ -231,6 +231,10 @@ class MotionController:
         waypoints = load_trajectory(self.traj_file)
         self._waypoints = waypoints
 
+        # 이전 세션에서 남은 값 초기화 (구독 전 리셋 — 초기값 즉시 발화 방지)
+        self._mcx.reset_jumpmode()
+        self._mcx.reset_homemode()
+
         self._mcx.subscribe_jumpmode(self._on_jump)
         self._mcx.subscribe_homemode(self._on_home)
 
@@ -242,7 +246,7 @@ class MotionController:
         return len(waypoints)
 
     def _on_jump(self):
-        # move_l 실행 중에는 추가 발화 무시 (이중 실행 방지)
+        # move_j 실행 중에는 추가 발화 무시 (이중 실행 방지)
         if not self._in_movel:
             self._jump_event.set()
 
@@ -260,7 +264,7 @@ class MotionController:
                 self._jump_event.clear()     # reset 완료 후 재발화된 이벤트 제거
                 if log_cb:
                     log_cb('점프 궤적 실행')
-                self.move_l(self._waypoints, log_cb=log_cb)
+                self.move_j(self._waypoints, log_cb=log_cb)
                 if log_cb:
                     log_cb('moveL 완료. 다음 점프 대기 중...')
 
@@ -277,7 +281,7 @@ class MotionController:
     def load_trajectory(self) -> list:
         return load_trajectory(self.traj_file)
 
-    def move_l(self, waypoints: list, dt: float = None, log_cb=None):
+    def move_j(self, waypoints: list, dt: float = None, log_cb=None):
         """
         4축 동시 궤적 실행.
         waypoints : list of tuple(th1, th2, th3, th4) [rad]
@@ -368,7 +372,7 @@ class MotionController:
                             for i in range(N_AXES))
             )
 
-        self.move_l(waypoints, log_cb=log_cb)
+        self.move_j(waypoints, log_cb=log_cb)
 
     # ── tracking 모드: 외부 명령 수신 ─────────────────────────────────────────
     def set_command(self,
