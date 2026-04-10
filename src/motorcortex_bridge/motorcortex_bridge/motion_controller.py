@@ -1,6 +1,6 @@
 """
 motion_controller.py
-궤적 실행 / moveL / 제어 루프 / 제어 모드 처리 전담 클래스
+궤적 실행 / moveJ / moveL / 제어 루프 / 제어 모드 처리 전담 클래스
 ROS2 의존성 없음 — joint_state_bridge 에서 생성하여 사용
 
 제어 모드 (GRID root/UserParameters/controlMode):
@@ -13,6 +13,9 @@ ROS2 의존성 없음 — joint_state_bridge 에서 생성하여 사용
   interp_q[i] = prev[i] + t * (target[i] - prev[i])   t ∈ [0, 1]
   t = elapsed / CMD_PERIOD   (CMD_PERIOD = 1/50Hz = 0.02s)
 
+moveJ: joint 공간 waypoint → 사다리꼴 속도 프로파일 → MCX 전송
+moveL: Cartesian waypoint → 선형 보간 → IK → MCX 전송
+
 Unitree LowCmd 매핑:
   motorCmd[i].q   → target joint position  [rad]
   motorCmd[i].dq  → target joint velocity  [rad/s]  (시뮬레이터 미지원 → 무시)
@@ -24,6 +27,7 @@ Unitree LowCmd 매핑:
 import threading
 import time
 import math
+import numpy as np
 
 from motorcortex_bridge.motorcortex_interface import (
     MotorcortexInterface,
@@ -38,7 +42,6 @@ from motorcortex_bridge.motorcortex_interface import (
 
 # ── 홈 자세 ────────────────────────────────────────────────────────────────────
 Q_HOME_DEG = [0.0, -150.0, -90.0, 90.0]
-#Q_HOME_DEG = [0.0, 0.0, 0.0, 0.0]
 Q_HOME_RAD = [math.radians(d) for d in Q_HOME_DEG]
 
 # ── 기본값 ─────────────────────────────────────────────────────────────────────
@@ -49,6 +52,111 @@ HOLD_CYCLE         = 0.005   # 200 Hz (보간 루프 주기)
 HOME_THRESHOLD_RAD = math.radians(0.1)   # 홈 판정 임계값 (0.1°)
 HOME_MAX_VEL       = math.radians(60.0)  # 홈 복귀 최대 각속도 [rad/s] (60°/s)
 HOME_MAX_ACC       = math.radians(30.0)  # 홈 복귀 최대 각가속도 [rad/s²] (30°/s²)
+
+# ── DH 파라미터 (leg_sim_v1.py 동기화) ─────────────────────────────────────────
+# [alpha, a(m), d(m)]
+_DH = [
+    (-math.pi/2, 0.0,   0.0   ),   # Joint 1: Hip Abduction
+    (0.0,        0.21,  0.0075),   # Joint 2: Hip Pitch
+    (0.0,        0.21,  0.0   ),   # Joint 3: Knee
+    (0.0,        0.148, 0.0   ),   # Joint 4: Ankle
+]
+_A2 = _DH[1][1]    # 0.21 m
+_A3 = _DH[2][1]    # 0.21 m
+_A4 = _DH[3][1]    # 0.148 m
+_D2 = _DH[1][2]    # 0.0075 m
+
+
+# ── FK ────────────────────────────────────────────────────────────────────────
+def _dh_matrix(alpha, a, d, theta):
+    ct, st = math.cos(theta), math.sin(theta)
+    ca, sa = math.cos(alpha), math.sin(alpha)
+    return np.array([
+        [ct, -st*ca,  st*sa, a*ct],
+        [st,  ct*ca, -ct*sa, a*st],
+        [ 0,     sa,     ca,    d],
+        [ 0,      0,      0,    1],
+    ], dtype=float)
+
+
+def forward_kinematics(thetas: list) -> list:
+    """
+    4축 FK. 각 관절 원점 좌표 반환 (힙=원점 기준).
+    반환: [p0, p1, p2, p3, p4]  (p0=힙, p4=발끝)
+    """
+    T = np.eye(4)
+    pts = [np.zeros(3)]
+    for i, (alpha, a, d) in enumerate(_DH):
+        T = T @ _dh_matrix(alpha, a, d, thetas[i])
+        pts.append(T[:3, 3].copy())
+    return pts
+
+
+def analytical_ik(Px: float, Py: float, Pz: float,
+                  phi: float, elbow_up: bool = True):
+    """
+    해석적 IK (leg_sim_v1.py 참조, 4축).
+    Px, Py, Pz : 발끝 목표 좌표 [m]  (힙 원점 기준)
+    phi        : θ2+θ3+θ4 유지 각도 [rad]
+    반환       : [θ1, θ2, θ3, θ4] [rad]  또는 None (해 없음)
+    """
+    D2 = Px**2 + Py**2 - _D2**2
+    if D2 < 0:
+        return None
+    R = math.sqrt(D2)
+
+    theta1 = math.atan2(-Px, Py) - math.atan2(R, _D2)
+
+    c1, s1 = math.cos(theta1), math.sin(theta1)
+    x_s = c1 * Px + s1 * Py
+    Z   = -Pz
+
+    x3 = x_s - _A4 * math.cos(phi)
+    z3 = Z   - _A4 * math.sin(phi)
+
+    cos_th3 = (x3**2 + z3**2 - _A2**2 - _A3**2) / (2.0 * _A2 * _A3)
+    cos_th3 = max(-1.0, min(1.0, cos_th3))
+    theta3  = -math.acos(cos_th3) if elbow_up else math.acos(cos_th3)
+
+    theta2 = (math.atan2(z3, x3)
+              - math.atan2(_A3 * math.sin(theta3),
+                           _A2 + _A3 * math.cos(theta3)))
+
+    theta4 = phi - theta2 - theta3
+
+    def wrap(a):
+        return (a + math.pi) % (2 * math.pi) - math.pi
+
+    return [wrap(theta1), wrap(theta2), wrap(theta3), wrap(theta4)]
+
+
+# ── Trajectory 생성 ────────────────────────────────────────────────────────────
+def _quintic_coeffs(t0, tf, p0, v0, a0, pf, vf, af):
+    """5차 다항식 계수 계산 (경계조건: 위치·속도·가속도)"""
+    T_mat = np.array([
+        [1, t0, t0**2,   t0**3,   t0**4,   t0**5],
+        [0,  1, 2*t0, 3*t0**2, 4*t0**3, 5*t0**4],
+        [0,  0,    2,   6*t0, 12*t0**2, 20*t0**3],
+        [1, tf, tf**2,   tf**3,   tf**4,   tf**5],
+        [0,  1, 2*tf, 3*tf**2, 4*tf**3, 5*tf**4],
+        [0,  0,    2,   6*tf, 12*tf**2, 20*tf**3],
+    ])
+    return np.linalg.solve(T_mat, np.array([p0, v0, a0, pf, vf, af]))
+
+
+def _eval_quintic(c, t):
+    return (c[0] + c[1]*t + c[2]*t**2 + c[3]*t**3
+            + c[4]*t**4 + c[5]*t**5)
+
+
+def _quintic_segment(p0, pf, duration, dt):
+    """
+    단일 구간 5차 다항식 보간 (시작/끝 속도·가속도=0).
+    반환: list of float (위치)
+    """
+    c = _quintic_coeffs(0, duration, p0, 0, 0, pf, 0, 0)
+    n = max(1, int(duration / dt))
+    return [_eval_quintic(c, k * duration / n) for k in range(1, n + 1)]
 
 
 def trapezoid_profile(dist: float, max_vel: float, max_acc: float, dt: float) -> list:
@@ -277,23 +385,19 @@ class MotionController:
                 if log_cb:
                     log_cb('홈 복귀 완료')
 
-    # ── 궤적 실행 ─────────────────────────────────────────────────────────────
+    # ── 궤적 실행 공통 내부 함수 ──────────────────────────────────────────────
     def load_trajectory(self) -> list:
         return load_trajectory(self.traj_file)
 
-    def move_j(self, waypoints: list, dt: float = None, log_cb=None):
+    def _send_waypoints(self, waypoints: list, dt: float, label: str, log_cb=None):
         """
-        4축 동시 궤적 실행.
-        waypoints : list of tuple(th1, th2, th3, th4) [rad]
+        미리 계산된 joint 공간 waypoints를 MCX에 전송 (blocking).
+        waypoints : list of list[float]  [rad]
         dt        : waypoint 간격 [s]
-        log_cb    : 진행 로그용 콜백 fn(str) — 선택
         """
-        dt = dt if dt is not None else self.traj_dt
-
         self._ctrl_ready = False
         self._in_movel   = True
 
-        # 제어 루프 종료 대기 + 네트워크 큐 소진
         time.sleep(0.05)
         try:
             self._mcx.get_target_positions()
@@ -301,7 +405,7 @@ class MotionController:
             pass
 
         if log_cb:
-            log_cb(f'moveL 시작: {len(waypoints)} waypoints / dt={dt*1000:.1f}ms')
+            log_cb(f'{label} 시작: {len(waypoints)} waypoints / dt={dt*1000:.1f}ms')
 
         t0 = time.monotonic()
         for idx, wp in enumerate(waypoints):
@@ -311,7 +415,7 @@ class MotionController:
 
             if log_cb and idx % max(1, int(1.0 / dt)) == 0:
                 log_cb(
-                    f'moveL [{idx}/{len(waypoints)}] '
+                    f'{label} [{idx}/{len(waypoints)}] '
                     + '  '.join(f'th{i+1}={math.degrees(wp[i]):+.2f}°'
                                 for i in range(N_AXES))
                 )
@@ -321,13 +425,101 @@ class MotionController:
                 time.sleep(sleep_t)
 
         self._in_movel = False
-        # interp 상태를 최종 위치로 동기화 (복귀 방지)
         with self._lock:
             self._interp_prev   = list(self._last_cmd_pos)
             self._interp_target = list(self._last_cmd_pos)
         self._ctrl_ready = True
         if log_cb:
-            log_cb('moveL 완료 — interp loop 재개.')
+            log_cb(f'{label} 완료 — interp loop 재개.')
+
+    # ── moveJ ─────────────────────────────────────────────────────────────────
+    def move_j(self, joint_waypoints: list, dt: float = None,
+               max_vel: float = HOME_MAX_VEL, max_acc: float = HOME_MAX_ACC,
+               log_cb=None):
+        """
+        Joint 공간 moveJ.
+        joint_waypoints : list of list[float] [rad]
+                          waypoint가 1개이면 현재 위치 → 목표 사다리꼴 프로파일 생성.
+                          여러 개이면 순서대로 각 구간을 5차 다항식으로 보간.
+        dt              : 전송 주기 [s] (기본 200Hz)
+        max_vel / max_acc : 단일 목표점 이동 시 사다리꼴 프로파일 파라미터
+        log_cb          : 로그 콜백 fn(str)
+        """
+        dt = dt if dt is not None else self.traj_dt
+
+        with self._lock:
+            current = list(self._last_cmd_pos)
+
+        all_waypoints = [current] + [list(wp) for wp in joint_waypoints]
+        dense = []
+
+        for seg_i in range(len(all_waypoints) - 1):
+            p0 = all_waypoints[seg_i]
+            pf = all_waypoints[seg_i + 1]
+            dists = [abs(pf[i] - p0[i]) for i in range(N_AXES)]
+            max_dist = max(dists) if max(dists) > 0 else 1e-6
+
+            # 사다리꼴 프로파일로 구간 시간 결정
+            profile = trapezoid_profile(max_dist, max_vel, max_acc, dt)
+            n = len(profile)
+            duration = n * dt
+
+            # 각 축을 5차 다항식으로 보간
+            segs = [_quintic_segment(p0[i], pf[i], duration, dt)
+                    for i in range(N_AXES)]
+            n_pts = len(segs[0])
+            for k in range(n_pts):
+                dense.append([segs[i][k] for i in range(N_AXES)])
+
+        self._send_waypoints(dense, dt, 'moveJ', log_cb)
+
+    # ── moveL ─────────────────────────────────────────────────────────────────
+    def move_l(self, cartesian_waypoints: list, phi: float = None,
+               dt: float = None, log_cb=None):
+        """
+        Cartesian 공간 moveL.
+        cartesian_waypoints : list of (Px, Py, Pz) [m]  힙 원점 기준
+                              각 구간을 선형 보간 → IK → joint 전송.
+        phi     : θ2+θ3+θ4 유지 각도 [rad].
+                  None이면 현재 joint 값에서 자동 계산.
+        dt      : 전송 주기 [s] (기본 200Hz)
+        log_cb  : 로그 콜백 fn(str)
+        """
+        dt = dt if dt is not None else self.traj_dt
+
+        with self._lock:
+            current_j = list(self._last_cmd_pos)
+
+        # phi 자동 계산 (현재 joint 기준)
+        if phi is None:
+            phi = current_j[1] + current_j[2] + current_j[3]
+
+        # 현재 발끝 위치를 시작점으로
+        fk_pts = forward_kinematics(current_j)
+        p_start = fk_pts[-1].tolist()
+
+        all_cart = [p_start] + [list(wp) for wp in cartesian_waypoints]
+        dense_j  = []
+
+        for seg_i in range(len(all_cart) - 1):
+            p0 = np.array(all_cart[seg_i])
+            pf = np.array(all_cart[seg_i + 1])
+            dist = float(np.linalg.norm(pf - p0))
+            n = max(1, int(dist / (max(HOME_MAX_VEL, 0.01) * dt)))
+
+            prev_j = list(current_j) if seg_i == 0 else dense_j[-1]
+            for k in range(1, n + 1):
+                t = k / n
+                pt = p0 + t * (pf - p0)
+                result = analytical_ik(pt[0], pt[1], pt[2], phi)
+                if result is None:
+                    if log_cb:
+                        log_cb(f'moveL IK 실패: seg={seg_i} k={k} pt={pt}')
+                    result = prev_j
+                prev_j = result
+                dense_j.append(result)
+
+        self._send_waypoints(dense_j, dt, 'moveL', log_cb)
 
     # ── 홈 복귀 궤적 ─────────────────────────────────────────────────────────────
     def move_to_home(self, max_vel: float = HOME_MAX_VEL,
