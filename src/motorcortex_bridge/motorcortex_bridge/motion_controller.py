@@ -338,7 +338,7 @@ class MotionController:
         """
         waypoints = load_trajectory(self.traj_file)
         self._waypoints = waypoints
-
+        time.sleep(0.01)
         # 이전 세션에서 남은 값 초기화 (구독 전 리셋 — 초기값 즉시 발화 방지)
         self._mcx.reset_jumpmode()
         self._mcx.reset_homemode()

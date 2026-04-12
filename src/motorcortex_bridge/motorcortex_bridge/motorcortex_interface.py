@@ -64,7 +64,6 @@ JOINT_LOOP_MAP = [
 ACTUAL_PATH  = 'root/AxesControl/axesPositionsActual'   # 부모 경로, value[0~4] 인덱싱
 POS_CMD_PATH = 'root/MachineControl/hostInJointPosition2'
 
-
 class MotorcortexInterface:
     """
     MCX-OS 통신 래퍼.
