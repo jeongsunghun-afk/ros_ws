@@ -124,6 +124,7 @@ class JointStateBridge(Node):
                 self._mcx.subscribe_control_mode(self._on_control_mode)
 
                 actual = self._mcx.get_actual_positions_snapshot()
+                self._mcx.set_base_pos(actual)           # additive 기준점 저장
                 self._ctrl.set_initial_positions(actual)
                 self.get_logger().info(
                     '초기 위치 로드: '

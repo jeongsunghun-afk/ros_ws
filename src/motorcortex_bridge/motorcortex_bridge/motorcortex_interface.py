@@ -30,14 +30,15 @@ ENGAGED_STATE      = 4      # ENGAGED_S
 ENGAGE_TIMEOUT     = 10.0
 
 CONTROL_MODE_PATH   = 'root/UserParameters/controlMode'
+ADDITIVE_CMD_PATH   = 'root/MachineControl/hostInJointAdditivePosition2'  # additive [rad]
 
 # ── 이벤트 경로 (GRID UserParameters) ──────────────────────────────────────────
-JUMP_EVENT_PATH    = 'root/UserParameters/JumpEvent'    # 점프 궤적 실행
-HOME_EVENT_PATH    = 'root/UserParameters/HomeEvent'    # 홈 복귀
-MOVE_L_EVENT_PATH  = 'root/UserParameters/moveLEvent'   # moveL (PD 위치 제어)
-FORCE_S_EVENT_PATH = 'root/UserParameters/ForceSEvent'  # forceS (정적 임피던스 I.C.)
-FORCE_T_EVENT_PATH = 'root/UserParameters/ForceTEvent'  # forceT (GRF 궤적 임피던스)
-GAIT_EVENT_PATH    = 'root/UserParameters/GaitEvent'    # gait (보행 궤적)
+JUMP_EVENT_PATH    = 'root/UserParameters/jumpmode'     # 점프 궤적 실행
+HOME_EVENT_PATH    = 'root/UserParameters/homemode'     # 홈 복귀
+MOVE_L_EVENT_PATH  = 'root/UserParameters/stopmode'     # moveL (PD 위치 제어)
+FORCE_S_EVENT_PATH = 'root/UserParameters/stopmode'     # forceS (정적 임피던스 I.C.)
+FORCE_T_EVENT_PATH = 'root/UserParameters/stopmode'     # forceT (GRF 궤적 임피던스)
+GAIT_EVENT_PATH    = 'root/UserParameters/stopmode'     # gait (보행 궤적)
 
 # ── 제어 모드 값 (controlMode) ─────────────────────────────────────────────────
 #   0 = standby  : 마지막 위치 유지 (기본)
@@ -97,6 +98,7 @@ class MotorcortexInterface:
         self._actual_pos_rad  = [0.0] * len(JOINT_LOOP_MAP)
         self._last_target_rad = [0.0] * N_AXES
         self._actual_torque   = [0.0] * N_AXES   # actuatorTorqueActual (Nm)
+        self._base_pos        = [0.0] * N_AXES   # JogMode 진입 시점 절대 위치 (additive 기준)
 
     # ── 연결 ─────────────────────────────────────────────────────────────────
     def connect(self, timeout_ms: int = 5000) -> bool:
@@ -157,6 +159,32 @@ class MotorcortexInterface:
         future = self._req.setParameter(POS_CMD_PATH, cmd)
         with self._lock:
             self._last_target_rad = list(positions_rad[:N_AXES])
+        if blocking:
+            future.get()
+
+    def set_base_pos(self, positions_rad: list):
+        """
+        JogMode 진입 시점 절대 위치를 base_pos로 저장.
+        set_additive_positions()의 기준점이 됨.
+        초기화 시 get_actual_positions_snapshot() 결과를 전달.
+        """
+        with self._lock:
+            self._base_pos = list(positions_rad[:N_AXES])
+
+    def set_additive_positions(self, target_abs: list, blocking: bool = False):
+        """
+        hostInJointAdditivePosition2에 additive 명령 전송.
+        additive[i] = target_abs[i] - base_pos[i]
+
+        target_abs : 목표 절대 위치 [rad]  (N_AXES,)
+        """
+        with self._lock:
+            base = list(self._base_pos)
+        additive = [target_abs[i] - base[i] for i in range(N_AXES)]
+        cmd      = additive + [0.0] * (NUM_CH - N_AXES)
+        future   = self._req.setParameter(ADDITIVE_CMD_PATH, cmd)
+        with self._lock:
+            self._last_target_rad = list(target_abs[:N_AXES])
         if blocking:
             future.get()
 

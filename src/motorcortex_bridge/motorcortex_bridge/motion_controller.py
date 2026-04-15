@@ -18,8 +18,8 @@ ROS2 의존성 없음 — joint_state_bridge 에서 생성하여 사용
   JumpEvent   — 점프 궤적 실행 (.txt)
   HomeEvent   — 홈 복귀
   moveLEvent  — moveL (PD 위치 제어, Cartesian)  [leg_test]
-  ForceSEvent — forceS (정적 임피던스 I.C.)       [leg_test, 추후 구현]
-  ForceTEvent — forceT (GRF 궤적 임피던스)        [leg_test, 추후 구현]
+  ForceSEvent — forceS (정적 임피던스 I.C.)       [leg_test]
+  ForceTEvent — forceT (GRF 궤적 임피던스)        [leg_test]
   GaitEvent   — gait (보행 궤적)                 [leg_test, 추후 구현]
 
   * moveJ 는 이벤트 없이 직접 호출 메서드로 제공
@@ -60,9 +60,11 @@ TRAJ_FILE_DEFAULT  = '/home/jsh/leg_sim/trajectory_jump.txt'
 TRAJ_DT_DEFAULT    = 0.005    # 200 Hz
 CMD_PERIOD         = 0.02    # 외부 명령 수신 주기 [s] (tracking 모드 기준, 50 Hz)
 HOLD_CYCLE         = 0.005   # 200 Hz (보간 루프 주기)
-HOME_THRESHOLD_RAD = math.radians(0.1)   # 홈 판정 임계값 (0.1°)
-HOME_MAX_VEL       = math.radians(60.0)  # 홈 복귀 최대 각속도 [rad/s] (60°/s)
-HOME_MAX_ACC       = math.radians(30.0)  # 홈 복귀 최대 각가속도 [rad/s²] (30°/s²)
+HOME_THRESHOLD_RAD = math.radians(0.01)  # 홈 판정 임계값 (0.01°)
+HOME_SPEED_DEG     = 10.0                # ★ 홈 복귀 속도 조정 [°/s] ← 이 값만 변경
+HOME_MAX_VEL       = math.radians(HOME_SPEED_DEG)        # [rad/s]
+HOME_MAX_ACC       = math.radians(HOME_SPEED_DEG / 2.0)  # [rad/s²]
+MOVEL_VEL          = 0.05               # moveL Cartesian 이동 속도 [m/s]
 
 # ── DH 파라미터 (leg_sim_v4.py 동기화) ─────────────────────────────────────────
 # [alpha, a(m), d(m)]
@@ -154,6 +156,34 @@ def compute_gravity_torque(thetas: list) -> np.ndarray:
         for j in range(k + 1):               # 관절 j (j ≤ k 인 관절이 링크 k에 영향)
             tau_g[j] += np.dot(np.cross(z_axes[j], p_com - origins[j]), f_grav)
     return tau_g
+
+
+def _compute_kinematics(thetas: list):
+    """
+    단일 DH 패스로 FK / Jacobian / 중력 토크를 동시 계산.
+    forceS / forceT 200Hz 루프에서 DH 행렬 중복 계산 방지용.
+
+    반환: (x_foot, J, tau_g)
+      x_foot : 발끝 위치 [m]       (3,) ndarray
+      J      : 위치 자코비안 (3, N_AXES)
+      tau_g  : 중력 보상 토크 [Nm] (N_AXES,)
+    """
+    origins, z_axes = _get_origins_zaxes(thetas)
+    pe = origins[-1]
+    n  = len(thetas)
+
+    J = np.zeros((3, n))
+    for i in range(n):
+        J[:, i] = np.cross(z_axes[i], pe - origins[i])
+
+    tau_g = np.zeros(n)
+    for k in range(n):
+        p_com  = (origins[k] + origins[k + 1]) / 2.0
+        f_grav = LINK_MASS[k] * G_VEC
+        for j in range(k + 1):
+            tau_g[j] += np.dot(np.cross(z_axes[j], p_com - origins[j]), f_grav)
+
+    return pe.copy(), J, tau_g
 
 
 # ── 임피던스 제어 게인 (leg_sim_v4.py 동기화) ─────────────────────────────────
@@ -514,10 +544,12 @@ class MotionController:
             # ── HomeEvent ─────────────────────────────────────────────────────
             if self._home_ev.is_set():
                 self._home_ev.clear()
+                time.sleep(0.01)
+                self._mcx.reset_home_event()   # 실행 전 즉시 0 리셋 — 재발화 방지
+                self._home_ev.clear()          # reset 완료 후 재발화 제거
                 if log_cb:
                     log_cb('HomeEvent: 홈 복귀 실행')
                 self.move_to_home(log_cb=log_cb)
-                self._mcx.reset_home_event()
                 if log_cb:
                     log_cb('홈 복귀 완료')
 
@@ -550,8 +582,10 @@ class MotionController:
                 self._force_t_ev.clear()
                 self._mcx.reset_force_t_event()
                 if log_cb:
-                    log_cb('ForceTEvent: GRF 궤적 임피던스 제어 실행 (미구현)')
-                # TODO: GRF 기반 궤적 임피던스 제어 구현
+                    log_cb('ForceTEvent: GRF 궤적 임피던스 제어 시작')
+                self._run_force_t(log_cb=log_cb)
+                if log_cb:
+                    log_cb('forceT 완료. 다음 이벤트 대기 중...')
 
             # ── GaitEvent (leg_test) ──────────────────────────────────────────
             if self._gait_ev.is_set():
@@ -593,15 +627,19 @@ class MotionController:
         dt = self.traj_dt   # 200 Hz
 
         try:
+            # 속도 추정용 이전 발끝 위치 초기화
+            x_a_prev, _, _ = _compute_kinematics(self._mcx.actual_positions)
+
             t0 = time.monotonic()
             k  = 0
             while not (self._home_ev.is_set() or self._jump_ev.is_set()):
-                q_now   = self._mcx.actual_positions
-                x_now   = np.array(forward_kinematics(q_now)[-1])
-                J       = compute_jacobian(q_now)
+                q_now          = self._mcx.actual_positions
+                x_a, J, tau_g  = _compute_kinematics(q_now)   # DH 1회만 계산
 
-                tau_g   = compute_gravity_torque(q_now)
-                tau_imp = compute_impedance_torque(x_r, x_now, J)
+                dx_a     = (x_a - x_a_prev) / dt              # 발끝 속도 추정
+                x_a_prev = x_a.copy()
+
+                tau_imp = compute_impedance_torque(x_r, x_a, J, dx_a=dx_a)
                 tau_off = (tau_g + tau_imp).tolist()
 
                 self._mcx.set_target_positions(q_r)
@@ -620,6 +658,95 @@ class MotionController:
             self._ctrl_ready = True
             if log_cb:
                 log_cb('forceS 종료 — 토크 오프셋 초기화')
+
+    # ── forceT: GRF 궤적 임피던스 제어 루프 ──────────────────────────────────
+    def _run_force_t(self, log_cb=None):
+        """
+        GRF 궤적 임피던스 제어 루프 (blocking).
+
+        forceS 와 차이점:
+          - q_r 이 시간에 따라 변하는 궤적을 추종 (self._waypoints)
+          - Impulse 블록: 토크 센싱 → GRF 추정 → τ_grf = J^T · grf_est
+          - 제어 법칙: τ_off = τ_g − τ_grf + τ_imp
+              τ_g   : 중력 보상 (feedforward)
+              τ_grf : GRF 역변환 — 지면이 발을 지지하는 만큼 모터 토크 감산
+              τ_imp : Cartesian 임피던스 보정
+
+        종료 조건: HomeEvent, JumpEvent, 또는 궤적 완료
+        """
+        waypoints = getattr(self, '_waypoints', [])
+        if not waypoints:
+            if log_cb:
+                log_cb('forceT: 궤적 없음 — 중단')
+            return
+
+        if log_cb:
+            log_cb(
+                f'forceT 시작: {len(waypoints)} waypoints'
+                f' / dt={self.traj_dt*1000:.1f}ms'
+            )
+
+        self._in_movel   = True
+        self._ctrl_ready = False
+        dt = self.traj_dt   # 200 Hz
+
+        try:
+            # 속도 추정용 이전 발끝 위치 초기화
+            x_a_prev, _, _ = _compute_kinematics(self._mcx.actual_positions)
+            x_r_prev       = np.array(forward_kinematics(list(waypoints[0]))[-1])
+
+            t0 = time.monotonic()
+            for idx, q_r in enumerate(waypoints):
+                if self._home_ev.is_set() or self._jump_ev.is_set():
+                    if log_cb:
+                        log_cb('forceT: HomeEvent/JumpEvent 수신 — 조기 종료')
+                    break
+
+                q_r   = list(q_r)
+                q_now = self._mcx.actual_positions
+                x_a, J, tau_g = _compute_kinematics(q_now)   # DH 1회만 계산
+
+                # 발끝 속도 추정 (위치 미분)
+                x_r_cart = np.array(forward_kinematics(q_r)[-1])
+                dx_a     = (x_a     - x_a_prev) / dt
+                dx_r     = (x_r_cart - x_r_prev) / dt
+                x_a_prev = x_a.copy()
+                x_r_prev = x_r_cart.copy()
+
+                # Impulse: 토크 센싱 → GRF 추정
+                tau_actual = self._mcx.actual_torque
+                grf_est    = compute_grf(tau_actual, tau_g, J)
+
+                # Impedance: Cartesian 공간 오차 + 속도 보정
+                tau_imp = compute_impedance_torque(x_r_cart, x_a, J, dx_r=dx_r, dx_a=dx_a)
+
+                # 합산: 중력보상 − GRF역변환 + 임피던스
+                tau_grf = J.T @ grf_est
+                tau_off = (tau_g - tau_grf + tau_imp).tolist()
+
+                self._mcx.set_target_positions(q_r)
+                self._mcx.set_target_torques(tau_off)
+                with self._lock:
+                    self._last_cmd_pos = list(q_r)
+
+                if log_cb and idx % max(1, int(1.0 / dt)) == 0:
+                    log_cb(
+                        f'forceT [{idx}/{len(waypoints)}] '
+                        f'GRF=({grf_est[0]:.1f},{grf_est[1]:.1f},{grf_est[2]:.1f})N  '
+                        f'τ=({tau_off[0]:.1f},{tau_off[1]:.1f},'
+                        f'{tau_off[2]:.1f},{tau_off[3]:.1f})Nm'
+                    )
+
+                sleep_t = t0 + (idx + 1) * dt - time.monotonic()
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+        finally:
+            self._mcx.set_target_torques([0.0] * N_AXES)
+            self._in_movel   = False
+            self._ctrl_ready = True
+            if log_cb:
+                log_cb('forceT 종료 — 토크 오프셋 초기화')
 
     # ── 궤적 실행 공통 내부 함수 ──────────────────────────────────────────────
     def load_trajectory(self) -> list:
@@ -748,7 +875,7 @@ class MotionController:
             p0 = np.array(all_cart[seg_i])
             pf = np.array(all_cart[seg_i + 1])
             dist = float(np.linalg.norm(pf - p0))
-            n = max(1, int(dist / (max(HOME_MAX_VEL, 0.01) * dt)))
+            n = max(1, int(dist / (MOVEL_VEL * dt)))
 
             prev_j = list(current_j) if seg_i == 0 else dense_j[-1]
             for k in range(1, n + 1):
@@ -768,46 +895,68 @@ class MotionController:
     def move_to_home(self, max_vel: float = HOME_MAX_VEL,
                      max_acc: float = HOME_MAX_ACC, log_cb=None):
         """
-        현재 actual 위치 → [0, 0, 0, 0] 사다리꼴 속도 프로파일 궤적 실행 (blocking).
-        가장 많이 움직이는 축 기준으로 시간이 결정되고, 나머지 축은 비례 스케일.
-        모든 축이 HOME_THRESHOLD_RAD 이내이면 즉시 반환.
+        현재 actual 위치 → [0, 0, 0, 0] additive 위치 명령으로 홈 복귀 (blocking).
+        hostInJointAdditivePosition2 사용.
 
-        Parameters
-        ----------
-        max_vel : 최대 각속도 [rad/s]  (기본 HOME_MAX_VEL = 60°/s)
-        max_acc : 최대 각가속도 [rad/s²] (기본 HOME_MAX_ACC = 30°/s²)
+        HomeEvent 발생마다 그 시점의 actual 위치를 기준으로
+        사다리꼴 프로파일로 0° 수렴. 완료 후 실측 기반 1회 보정.
+        속도는 HOME_SPEED_DEG [°/s] 상수로 조정.
         """
-        current = self._mcx.get_actual_positions_snapshot()
+        # HomeEvent 발생 시점 실제 위치 읽기 — 매번 fresh하게 기준점 설정
+        start_pos = self._mcx.get_actual_positions_snapshot()
+        self._mcx.set_base_pos(start_pos)   # additive 기준 = 현재 위치
 
-        if all(abs(p) < HOME_THRESHOLD_RAD for p in current):
+        if all(abs(p) < HOME_THRESHOLD_RAD for p in start_pos):
             if log_cb:
                 log_cb('홈 복귀: 이미 홈 위치 — 스킵.')
             return
 
-        # 가장 큰 이동 거리 축 기준 사다리꼴 프로파일 생성
-        max_dist = max(abs(p) for p in current)
+        max_dist = max(abs(p) for p in start_pos)
         profile  = trapezoid_profile(max_dist, max_vel, max_acc, self.traj_dt)
         n_steps  = len(profile)
+        t_total  = n_steps * self.traj_dt
 
-        # 각 축을 거리에 비례하여 스케일
-        waypoints = [
-            tuple(
-                current[i] * (1.0 - profile[k] / max_dist)
-                for i in range(N_AXES)
-            )
-            for k in range(n_steps)
-        ]
-
-        t_total = n_steps * self.traj_dt
         if log_cb:
             log_cb(
                 f'홈 복귀 시작: {n_steps} steps / {t_total:.2f}s '
-                f'(max_vel={math.degrees(max_vel):.0f}°/s, max_acc={math.degrees(max_acc):.0f}°/s²)  '
-                + ', '.join(f'j{i+1}={math.degrees(current[i]):+.1f}°→0°'
+                f'({HOME_SPEED_DEG:.1f}°/s)  '
+                + ', '.join(f'j{i+1}={math.degrees(start_pos[i]):+.1f}°→0°'
                             for i in range(N_AXES))
             )
 
-        self.move_j(waypoints, log_cb=log_cb)
+        self._ctrl_ready = False
+        self._in_movel   = True
+
+        try:
+            t0 = time.monotonic()
+            for k, p in enumerate(profile):
+                # 각 축을 start_pos → 0 비례 보간
+                target = [start_pos[i] * (1.0 - p / max_dist) for i in range(N_AXES)]
+                self._mcx.set_additive_positions(target)
+                with self._lock:
+                    self._last_cmd_pos = target
+
+                sleep_t = t0 + (k + 1) * self.traj_dt - time.monotonic()
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+            # 실측 위치 기반 1회 보정
+            time.sleep(0.2)   # 궤적 완료 후 정착 대기
+            actual = self._mcx.actual_positions
+            correction = [-p for p in actual]
+            self._mcx.set_additive_positions(correction, blocking=True)
+
+            # hostInJointPosition2도 0으로 동기화 — interp_loop 재개 시 원위치 복귀 방지
+            self._mcx.set_target_positions([0.0] * N_AXES, blocking=True)
+            with self._lock:
+                self._last_cmd_pos = [0.0] * N_AXES
+
+        finally:
+            self._in_movel = False
+            with self._lock:
+                self._interp_prev   = [0.0] * N_AXES
+                self._interp_target = [0.0] * N_AXES
+            self._ctrl_ready = True
 
     # ── tracking 모드: 외부 명령 수신 ─────────────────────────────────────────
     def set_command(self,
