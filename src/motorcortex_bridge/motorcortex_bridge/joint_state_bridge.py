@@ -120,6 +120,7 @@ class JointStateBridge(Node):
                 # self.get_logger().info('JogMode 활성')
 
                 self._mcx.subscribe_positions()
+                self._mcx.subscribe_torque_actual()
                 self._mcx.subscribe_control_mode(self._on_control_mode)
 
                 actual = self._mcx.get_actual_positions_snapshot()
@@ -134,7 +135,7 @@ class JointStateBridge(Node):
 
                 n = self._ctrl.start(log_cb=lambda s: self.get_logger().info(s))
                 self.get_logger().info(
-                    f'궤적 로드: {n} waypoints — jumpmode/homemode 대기 중'
+                    f'궤적 로드: {n} waypoints — 이벤트 대기 중 (JumpEvent/HomeEvent/...)'
                 )
                 break
 
@@ -144,7 +145,7 @@ class JointStateBridge(Node):
 
     # ── controlMode 변경 콜백 ─────────────────────────────────────────────────
     def _on_control_mode(self, mode: int):
-        mode_names = {0: 'standby', 1: 'mpc', 2: 'tracking'}
+        mode_names = {0: 'standby', 1: 'MPC', 2: 'RL', 3: 'leg_test'}
         self.get_logger().info(f'controlMode → {mode} ({mode_names.get(mode, "standby")})')
         self._ctrl.set_control_mode(mode)
 

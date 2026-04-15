@@ -1,20 +1,33 @@
 """
 motion_controller.py
-궤적 실행 / moveJ / moveL / 제어 루프 / 제어 모드 처리 전담 클래스
+궤적 실행 / moveJ / moveL / forceS / forceT / 제어 루프 / 제어 모드 처리 전담 클래스
 ROS2 의존성 없음 — joint_state_bridge 에서 생성하여 사용
 
-제어 모드 (GRID root/UserParameters/controlMode):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+제어 모드 (GRID root/UserParameters/controlMode)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   0 = standby  — 마지막 위치 유지 (기본)
-  1 = mpc      — 내부 MPC 계산 (추후 구현)
-  2 = tracking — 외부 명령(RL 등) 추종, 50Hz → 200Hz 선형 보간
+  1 = MPC      — 내부 MPC 계산 (추후 구현)
+  2 = RL       — 외부 RL 명령 추종, 50Hz → 200Hz 선형 보간
+  3 = leg_test — 다리 테스트 모드 (이벤트로 동작 트리거)
   그 외 값     → standby로 처리
 
-보간 (tracking 모드):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+이벤트 트리거 (GRID root/UserParameters/*)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  JumpEvent   — 점프 궤적 실행 (.txt)
+  HomeEvent   — 홈 복귀
+  moveLEvent  — moveL (PD 위치 제어, Cartesian)  [leg_test]
+  ForceSEvent — forceS (정적 임피던스 I.C.)       [leg_test, 추후 구현]
+  ForceTEvent — forceT (GRF 궤적 임피던스)        [leg_test, 추후 구현]
+  GaitEvent   — gait (보행 궤적)                 [leg_test, 추후 구현]
+
+  * moveJ 는 이벤트 없이 직접 호출 메서드로 제공
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RL 보간 (RL 모드):
   interp_q[i] = prev[i] + t * (target[i] - prev[i])   t ∈ [0, 1]
   t = elapsed / CMD_PERIOD   (CMD_PERIOD = 1/50Hz = 0.02s)
-
-moveJ: joint 공간 waypoint → 사다리꼴 속도 프로파일 → MCX 전송
-moveL: Cartesian waypoint → 선형 보간 → IK → MCX 전송
 
 Unitree LowCmd 매핑:
   motorCmd[i].q   → target joint position  [rad]
@@ -33,11 +46,9 @@ from motorcortex_bridge.motorcortex_interface import (
     MotorcortexInterface,
     N_AXES,
     CTRL_MODE_STANDBY,
-    CTRL_MODE_TRACKING,
     CTRL_MODE_MPC,
-    TEST_MODE_POSITION,
-    TEST_MODE_FORCE,
-    TEST_MODE_Trajectory,
+    CTRL_MODE_RL,
+    CTRL_MODE_LEG_TEST,
 )
 
 # ── 홈 자세 ────────────────────────────────────────────────────────────────────
@@ -53,7 +64,7 @@ HOME_THRESHOLD_RAD = math.radians(0.1)   # 홈 판정 임계값 (0.1°)
 HOME_MAX_VEL       = math.radians(60.0)  # 홈 복귀 최대 각속도 [rad/s] (60°/s)
 HOME_MAX_ACC       = math.radians(30.0)  # 홈 복귀 최대 각가속도 [rad/s²] (30°/s²)
 
-# ── DH 파라미터 (leg_sim_v1.py 동기화) ─────────────────────────────────────────
+# ── DH 파라미터 (leg_sim_v4.py 동기화) ─────────────────────────────────────────
 # [alpha, a(m), d(m)]
 _DH = [
     (-math.pi/2, 0.0,   0.0   ),   # Joint 1: Hip Abduction
@@ -66,8 +77,14 @@ _A3 = _DH[2][1]    # 0.21 m
 _A4 = _DH[3][1]    # 0.148 m
 _D2 = _DH[1][2]    # 0.0075 m
 
+# ── 물리 파라미터 (leg_sim_v4.py 동기화) ─────────────────────────────────────
+# 링크 질량 [kg]  (Hip Abduction / Thigh / Shin / Foot)
+LINK_MASS = np.array([3.34, 0.8, 0.2, 0.2])
+G         = 9.81
+G_VEC     = np.array([-G, 0.0, 0.0])   # 중력 방향 (-X = 아래, 월드 기준)
 
-# ── FK ────────────────────────────────────────────────────────────────────────
+
+# ── FK / Jacobian 공통 유틸 ───────────────────────────────────────────────────
 def _dh_matrix(alpha, a, d, theta):
     ct, st = math.cos(theta), math.sin(theta)
     ca, sa = math.cos(alpha), math.sin(alpha)
@@ -79,17 +96,107 @@ def _dh_matrix(alpha, a, d, theta):
     ], dtype=float)
 
 
+def _get_origins_zaxes(thetas: list):
+    """
+    DH 순기구학으로 관절 원점·z축 배열 반환.
+    FK와 Jacobian이 공유하는 공통 유틸 — DH 행렬을 한 번만 계산.
+    반환: (origins, z_axes)
+      origins : [p0, p1, ..., p4]  각 관절 원점 (p0=힙)
+      z_axes  : [z0, z1, ..., z4]  각 관절 z축
+    """
+    T       = np.eye(4)
+    origins = [np.zeros(3)]
+    z_axes  = [np.array([0.0, 0.0, 1.0])]
+    for (alpha, a, d), theta in zip(_DH, thetas):
+        T = T @ _dh_matrix(alpha, a, d, theta)
+        origins.append(T[:3, 3].copy())
+        z_axes.append(T[:3, 2].copy())
+    return origins, z_axes
+
+
 def forward_kinematics(thetas: list) -> list:
     """
     4축 FK. 각 관절 원점 좌표 반환 (힙=원점 기준).
     반환: [p0, p1, p2, p3, p4]  (p0=힙, p4=발끝)
     """
-    T = np.eye(4)
-    pts = [np.zeros(3)]
-    for i, (alpha, a, d) in enumerate(_DH):
-        T = T @ _dh_matrix(alpha, a, d, thetas[i])
-        pts.append(T[:3, 3].copy())
-    return pts
+    origins, _ = _get_origins_zaxes(thetas)
+    return origins
+
+
+def compute_jacobian(thetas: list) -> np.ndarray:
+    """
+    3D 위치 자코비안 (3×N_AXES).
+    J[:,i] = z_i × (p_e - p_i)
+    반환: (3, N_AXES) ndarray
+    """
+    origins, z_axes = _get_origins_zaxes(thetas)
+    pe = origins[-1]
+    J  = np.zeros((3, len(thetas)))
+    for i in range(len(thetas)):
+        J[:, i] = np.cross(z_axes[i], pe - origins[i])
+    return J
+
+
+def compute_gravity_torque(thetas: list) -> np.ndarray:
+    """
+    링크 무게에 의한 중력 보상 토크 (N_AXES×1) [N·m].
+    τ_g[j] = Σ_{k≥j} (z_j × (p_com_k − p_j)) · (m_k · G_VEC)
+
+    p_com_k : 링크 k의 무게중심 = 관절 k와 k+1 원점의 중간점
+    _get_origins_zaxes 재사용으로 DH 행렬 중복 계산 없음.
+    """
+    origins, z_axes = _get_origins_zaxes(thetas)
+    n      = len(thetas)
+    tau_g  = np.zeros(n)
+    for k in range(n):                        # 링크 k (관절 k → k+1 사이)
+        p_com  = (origins[k] + origins[k + 1]) / 2.0
+        f_grav = LINK_MASS[k] * G_VEC        # 중력 하중 [N]
+        for j in range(k + 1):               # 관절 j (j ≤ k 인 관절이 링크 k에 영향)
+            tau_g[j] += np.dot(np.cross(z_axes[j], p_com - origins[j]), f_grav)
+    return tau_g
+
+
+# ── 임피던스 제어 게인 (leg_sim_v4.py 동기화) ─────────────────────────────────
+KP_IMP  = np.array([800.0, 800.0, 800.0])   # Cartesian 강성 [N/m]
+KD_IMP  = np.array([ 40.0,  40.0,  40.0])   # Cartesian 감쇠 [N·s/m]
+MU_DAMP = 1e-3                               # Jacobian 댐핑 계수 (특이점 방지)
+
+
+def compute_grf(tau_actual, tau_gravity, J: np.ndarray) -> np.ndarray:
+    """
+    실제 관절 토크로부터 지면반력(GRF) 추정 (leg_sim_v4.py 동기화).
+    λ = (J·Jᵀ + μI)⁻¹ · J · (τ_gravity - τ_actual)  [N]
+
+    tau_actual  : 실측 관절 토크 [Nm]  (N_AXES,) — actuatorTorqueActual
+    tau_gravity : 중력 보상 토크  [Nm]  (N_AXES,) — compute_gravity_torque()
+    J           : 자코비안 (3, N_AXES) — compute_jacobian()
+    반환        : GRF 추정값 [N]  (3,)  — [Fx, Fy, Fz]
+    """
+    tau_a = np.asarray(tau_actual,  dtype=float)
+    tau_g = np.asarray(tau_gravity, dtype=float)
+    JJT   = J @ J.T + MU_DAMP * np.eye(3)
+    return np.linalg.solve(JJT, J @ (tau_g - tau_a))
+
+
+def compute_impedance_torque(x_r, x_a, J: np.ndarray,
+                              dx_r=None, dx_a=None) -> np.ndarray:
+    """
+    Cartesian 공간 임피던스 제어 토크 (N_AXES×1) [N·m].
+
+    f_imp   = Kp*(x_r - x_a) + Kd*(dx_r - dx_a)
+    tau_imp = J^T · f_imp
+
+    x_r, x_a  : 발끝 목표/실제 위치 [m]  (3,)
+    J          : 자코비안 (3, N_AXES)   — compute_jacobian(q_actual)
+    dx_r, dx_a : 발끝 목표/실제 속도 [m/s]  (3,) — None 이면 0으로 처리
+    """
+    x_r  = np.asarray(x_r,  dtype=float)
+    x_a  = np.asarray(x_a,  dtype=float)
+    dx_r = np.zeros(3) if dx_r is None else np.asarray(dx_r, dtype=float)
+    dx_a = np.zeros(3) if dx_a is None else np.asarray(dx_a, dtype=float)
+
+    f_imp = KP_IMP * (x_r - x_a) + KD_IMP * (dx_r - dx_a)
+    return J.T @ f_imp
 
 
 def analytical_ik(Px: float, Py: float, Pz: float,
@@ -250,12 +357,8 @@ class MotionController:
         self._in_movel   = False
 
         # 제어 모드 (GRID controlMode 동기화)
-        # 1=mpc, 2=tracking, 그 외=0(standby)
+        # 0=standby, 1=MPC, 2=RL, 3=leg_test
         self._ctrl_mode = CTRL_MODE_STANDBY
-
-        # 위치 모드 (GRID positionMode 동기화)
-        # 0=position(moveJ/moveL), 1=force
-        self._pos_mode = TEST_MODE_POSITION
 
         # 마지막 명령 위치 (standby / publish 참조용)
         self._last_cmd_pos = list(Q_HOME_RAD)
@@ -271,9 +374,16 @@ class MotionController:
         self._cmd_kd  = [0.5]  * N_AXES
         self._cmd_tau = [0.0]  * N_AXES
 
-        # jump / home 이벤트
-        self._jump_event = threading.Event()
-        self._home_event = threading.Event()
+        # 이벤트 트리거 (GRID → Python Event)
+        self._jump_ev    = threading.Event()   # JumpEvent
+        self._home_ev    = threading.Event()   # HomeEvent
+        self._movel_ev   = threading.Event()   # moveLEvent
+        self._force_s_ev = threading.Event()   # ForceSEvent
+        self._force_t_ev = threading.Event()   # ForceTEvent
+        self._gait_ev    = threading.Event()   # GaitEvent
+
+        # moveL 목표 좌표 (힙 원점 기준, [m])  — 외부에서 set_movel_target()으로 설정
+        self._movel_target: list = None   # (Px, Py, Pz)  or  [(Px,Py,Pz), ...]
 
         # 보간 루프 스레드 시작
         self._interp_thread = threading.Thread(target=self._interp_loop, daemon=True)
@@ -293,30 +403,30 @@ class MotionController:
     def ctrl_mode(self) -> int:
         return self._ctrl_mode
 
-    # ── 제어 모드 전환 (GRID 구독 콜백에서 호출) ─────────────────────────────
+    # ── 제어 모드 전환 (GRID controlMode 구독 콜백에서 호출) ─────────────────────
     def set_control_mode(self, mode: int):
         """
         GRID controlMode 값으로 제어 모드 전환.
-        1=mpc, 2=tracking, 그 외 → 0(standby).
+          1 = MPC      : 내부 MPC 제어 (추후 구현)
+          2 = RL       : 외부 RL 명령 추종 (50Hz → 200Hz 보간)
+          3 = leg_test : 다리 테스트 모드 (각 이벤트로 동작 트리거)
+          그 외        → standby(0)
         """
-        if mode not in (CTRL_MODE_MPC, CTRL_MODE_TRACKING):
+        if mode not in (CTRL_MODE_MPC, CTRL_MODE_RL, CTRL_MODE_LEG_TEST):
             mode = CTRL_MODE_STANDBY
         with self._lock:
             self._ctrl_mode = mode
 
-    def set_test_mode(self, mode: int):
+    # ── moveL 목표 좌표 설정 ──────────────────────────────────────────────────
+    def set_movel_target(self, target):
         """
-        GRID positionMode 값으로 테스트 모드 전환.
-        0=position(moveJ/moveL), 1=force, 2=trajectory, 그 외 → 0(position).
+        moveLEvent 트리거 전에 호출하여 목표 좌표를 설정.
+        target : (Px, Py, Pz) [m]  or  [(Px,Py,Pz), ...]  (힙 원점 기준)
         """
-        if mode not in (TEST_MODE_POSITION, TEST_MODE_FORCE, TEST_MODE_Trajectory):
-            mode = TEST_MODE_POSITION
+        if target is not None and not isinstance(target[0], (list, tuple)):
+            target = [target]   # 단일 점 → 리스트로 통일
         with self._lock:
-            self._pos_mode = mode
-
-    @property
-    def test_mode(self) -> int:
-        return self._pos_mode
+            self._movel_target = target
 
     # ── 초기 위치 설정 (MCX joint offset 기준) ───────────────────────────────
     def set_initial_positions(self, positions: list):
@@ -332,7 +442,7 @@ class MotionController:
     # ── jump / home 이벤트 루프 시작 ──────────────────────────────────────────
     def start(self, log_cb=None) -> int:
         """
-        궤적 로드 + jumpmode/homemode 구독 + 이벤트 루프 스레드 시작.
+        궤적 로드 + 전체 이벤트 구독 + 이벤트 루프 스레드 시작.
         연결 완료 후 1회 호출.
         반환: waypoint 수
         """
@@ -340,11 +450,20 @@ class MotionController:
         self._waypoints = waypoints
         time.sleep(0.01)
         # 이전 세션에서 남은 값 초기화 (구독 전 리셋 — 초기값 즉시 발화 방지)
-        self._mcx.reset_jumpmode()
-        self._mcx.reset_homemode()
+        self._mcx.reset_jump_event()
+        self._mcx.reset_home_event()
+        self._mcx.reset_movel_event()
+        self._mcx.reset_force_s_event()
+        self._mcx.reset_force_t_event()
+        self._mcx.reset_gait_event()
 
-        self._mcx.subscribe_jumpmode(self._on_jump)
-        self._mcx.subscribe_homemode(self._on_home)
+        # 이벤트 구독
+        self._mcx.subscribe_jump_event(self._on_jump)
+        self._mcx.subscribe_home_event(self._on_home)
+        self._mcx.subscribe_movel_event(self._on_movel)
+        self._mcx.subscribe_force_s_event(self._on_force_s)
+        self._mcx.subscribe_force_t_event(self._on_force_t)
+        self._mcx.subscribe_gait_event(self._on_gait)
 
         self._event_thread = threading.Thread(
             target=self._event_loop, args=(log_cb,), daemon=True
@@ -353,46 +472,166 @@ class MotionController:
 
         return len(waypoints)
 
+    # ── 이벤트 콜백 (MCX GRID → Python Event) ────────────────────────────────
     def _on_jump(self):
-        # move_j 실행 중에는 추가 발화 무시 (이중 실행 방지)
         if not self._in_movel:
-            self._jump_event.set()
+            self._jump_ev.set()
 
     def _on_home(self):
-        self._home_event.set()
+        self._home_ev.set()
+
+    def _on_movel(self):
+        if not self._in_movel:
+            self._movel_ev.set()
+
+    def _on_force_s(self):
+        if not self._in_movel:
+            self._force_s_ev.set()
+
+    def _on_force_t(self):
+        if not self._in_movel:
+            self._force_t_ev.set()
+
+    def _on_gait(self):
+        if not self._in_movel:
+            self._gait_ev.set()
 
     def _event_loop(self, log_cb=None):
         while True:
-            jump_triggered = self._jump_event.wait(timeout=0.1)
-
+            # ── JumpEvent ─────────────────────────────────────────────────────
+            jump_triggered = self._jump_ev.wait(timeout=0.05)
             if jump_triggered:
-                self._in_movel = True        # 즉시 잠금: reset 완료 전 콜백 재발화 차단
-                self._jump_event.clear()
-                self._mcx.reset_jumpmode()   # blocking — MCX jumpmode=0 확정 후 복귀
-                self._jump_event.clear()     # reset 완료 후 재발화된 이벤트 제거
+                self._in_movel = True
+                self._jump_ev.clear()
+                self._mcx.reset_jump_event()   # blocking — MCX 값 0 확정 후 복귀
+                self._jump_ev.clear()          # reset 완료 후 재발화 제거
                 if log_cb:
-                    log_cb('점프 궤적 실행 (moveJ txt)')
-                self._send_waypoints(self._waypoints, self.traj_dt, 'moveJ(txt)', log_cb)
+                    log_cb('JumpEvent: 점프 궤적 실행')
+                self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb)
                 if log_cb:
-                    log_cb('moveJ(txt) 완료. 다음 점프 대기 중...')
+                    log_cb('jump 완료. 다음 이벤트 대기 중...')
 
-            if self._home_event.is_set():
-                self._home_event.clear()
+            # ── HomeEvent ─────────────────────────────────────────────────────
+            if self._home_ev.is_set():
+                self._home_ev.clear()
                 if log_cb:
-                    log_cb('홈 복귀 실행')
+                    log_cb('HomeEvent: 홈 복귀 실행')
                 self.move_to_home(log_cb=log_cb)
-                self._mcx.reset_homemode()
+                self._mcx.reset_home_event()
                 if log_cb:
                     log_cb('홈 복귀 완료')
+
+            # ── moveLEvent (leg_test) ─────────────────────────────────────────
+            if self._movel_ev.is_set():
+                self._movel_ev.clear()
+                self._mcx.reset_movel_event()
+                actual_j = self._mcx.actual_positions   # 센서 실제값
+                fk_pts   = forward_kinematics(actual_j)
+                p_cur  = fk_pts[-1].tolist()          # 현재 발끝 (Px, Py, Pz)
+                target = [(p_cur[0] - 0.01, p_cur[1], p_cur[2])]  # x -10mm
+                if log_cb:
+                    log_cb(
+                        f'moveLEvent: moveL 실행 '
+                        f'({p_cur[0]*1000:.1f}, {p_cur[1]*1000:.1f}, {p_cur[2]*1000:.1f}) mm'
+                        f' → ({target[0][0]*1000:.1f}, {target[0][1]*1000:.1f}, {target[0][2]*1000:.1f}) mm'
+                    )
+                self.move_l(target, log_cb=log_cb)
+
+            # ── ForceSEvent (leg_test) ────────────────────────────────────────
+            if self._force_s_ev.is_set():
+                self._force_s_ev.clear()
+                self._mcx.reset_force_s_event()
+                if log_cb:
+                    log_cb('ForceSEvent: 정적 임피던스 제어 시작')
+                self._run_force_s(log_cb=log_cb)
+
+            # ── ForceTEvent (leg_test) ────────────────────────────────────────
+            if self._force_t_ev.is_set():
+                self._force_t_ev.clear()
+                self._mcx.reset_force_t_event()
+                if log_cb:
+                    log_cb('ForceTEvent: GRF 궤적 임피던스 제어 실행 (미구현)')
+                # TODO: GRF 기반 궤적 임피던스 제어 구현
+
+            # ── GaitEvent (leg_test) ──────────────────────────────────────────
+            if self._gait_ev.is_set():
+                self._gait_ev.clear()
+                self._mcx.reset_gait_event()
+                if log_cb:
+                    log_cb('GaitEvent: 보행 궤적 실행 (미구현)')
+                # TODO: GaitController 연동
+
+    # ── forceS: 정적 임피던스 제어 루프 ──────────────────────────────────────
+    def _run_force_s(self, log_cb=None):
+        """
+        정적 임피던스 제어 루프 (blocking).
+        목표: 현재 발끝 위치에서 X축 +10mm 지점을 q_r로 유지하며
+              Cartesian 임피던스 토크(tau_imp) + 중력 보상(tau_g)을 동시 전송.
+
+        종료 조건: HomeEvent 또는 JumpEvent 발생
+        """
+        # ── 목표 발끝 위치 계산 ───────────────────────────────────────────────
+        q_a   = self._mcx.actual_positions
+        x_a   = np.array(forward_kinematics(q_a)[-1])
+        x_r   = x_a + np.array([0.01, 0.0, 0.0])    # X +10mm
+        phi   = q_a[1] + q_a[2] + q_a[3]
+
+        q_r = analytical_ik(x_r[0], x_r[1], x_r[2], phi)
+        if q_r is None:
+            if log_cb:
+                log_cb('forceS: IK 실패 — 중단')
+            return
+
+        if log_cb:
+            log_cb(
+                f'forceS 시작: x_r=({x_r[0]*1000:.1f}, {x_r[1]*1000:.1f},'
+                f' {x_r[2]*1000:.1f}) mm'
+            )
+
+        self._in_movel   = True
+        self._ctrl_ready = False
+        dt = self.traj_dt   # 200 Hz
+
+        try:
+            t0 = time.monotonic()
+            k  = 0
+            while not (self._home_ev.is_set() or self._jump_ev.is_set()):
+                q_now   = self._mcx.actual_positions
+                x_now   = np.array(forward_kinematics(q_now)[-1])
+                J       = compute_jacobian(q_now)
+
+                tau_g   = compute_gravity_torque(q_now)
+                tau_imp = compute_impedance_torque(x_r, x_now, J)
+                tau_off = (tau_g + tau_imp).tolist()
+
+                self._mcx.set_target_positions(q_r)
+                self._mcx.set_target_torques(tau_off)
+                with self._lock:
+                    self._last_cmd_pos = list(q_r)
+
+                k += 1
+                sleep_t = t0 + k * dt - time.monotonic()
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+        finally:
+            self._mcx.set_target_torques([0.0] * N_AXES)
+            self._in_movel   = False
+            self._ctrl_ready = True
+            if log_cb:
+                log_cb('forceS 종료 — 토크 오프셋 초기화')
 
     # ── 궤적 실행 공통 내부 함수 ──────────────────────────────────────────────
     def load_trajectory(self) -> list:
         return load_trajectory(self.traj_file)
 
-    def _send_waypoints(self, waypoints: list, dt: float, label: str, log_cb=None):
+    def _send_cst(self, waypoints: list, dt: float, label: str,
+                  torques: list = None, log_cb=None):
         """
-        미리 계산된 joint 공간 waypoints를 MCX에 전송 (blocking).
-        waypoints : list of list[float]  [rad]
+        joint 공간 waypoints를 MCX에 전송 (blocking).
+        waypoints : list of list[float]  [rad]          — q_r
+        torques   : list of list[float]  [Nm] or None   — τ_offset (τ_ff + τ_imp)
+                    None이면 토크 오프셋 0으로 전송
         dt        : waypoint 간격 [s]
         """
         self._ctrl_ready = False
@@ -404,12 +643,15 @@ class MotionController:
         except Exception:
             pass
 
+        zero_torque = [0.0] * N_AXES
         if log_cb:
             log_cb(f'{label} 시작: {len(waypoints)} waypoints / dt={dt*1000:.1f}ms')
 
         t0 = time.monotonic()
         for idx, wp in enumerate(waypoints):
+            tau = torques[idx] if (torques and idx < len(torques)) else zero_torque
             self._mcx.set_target_positions(list(wp))
+            self._mcx.set_target_torques(tau)
             with self._lock:
                 self._last_cmd_pos = list(wp)
 
@@ -424,6 +666,7 @@ class MotionController:
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
+        self._mcx.set_target_torques(zero_torque)   # 완료 후 토크 오프셋 초기화
         self._in_movel = False
         with self._lock:
             self._interp_prev   = list(self._last_cmd_pos)
@@ -471,7 +714,7 @@ class MotionController:
             for k in range(n_pts):
                 dense.append([segs[i][k] for i in range(N_AXES)])
 
-        self._send_waypoints(dense, dt, 'moveJ', log_cb)
+        self._send_cst(dense, dt, 'moveJ', log_cb)
 
     # ── moveL ─────────────────────────────────────────────────────────────────
     def move_l(self, cartesian_waypoints: list, phi: float = None,
@@ -519,7 +762,7 @@ class MotionController:
                 prev_j = result
                 dense_j.append(result)
 
-        self._send_waypoints(dense_j, dt, 'moveL', log_cb)
+        self._send_cst(dense_j, dt, 'moveL', log_cb)
 
     # ── 홈 복귀 궤적 ─────────────────────────────────────────────────────────────
     def move_to_home(self, max_vel: float = HOME_MAX_VEL,
@@ -620,7 +863,8 @@ class MotionController:
             with self._lock:
                 mode = self._ctrl_mode
 
-                if mode == CTRL_MODE_TRACKING:
+                if mode == CTRL_MODE_RL:
+                    # RL 명령 추종: prev → target 선형 보간 (50Hz 명령 → 200Hz 전송)
                     elapsed = time.monotonic() - self._interp_time
                     t = min(elapsed / CMD_PERIOD, 1.0)
                     positions = [
@@ -631,7 +875,8 @@ class MotionController:
                     # TODO: MPC 계산 구현
                     positions = list(self._last_cmd_pos)
                 else:
-                    # standby (mode == 0 또는 미정의 값)
+                    # standby / leg_test : 마지막 명령 위치 유지
+                    # (leg_test 동작은 _event_loop에서 _send_cst로 별도 처리)
                     positions = list(self._last_cmd_pos)
 
             try:
