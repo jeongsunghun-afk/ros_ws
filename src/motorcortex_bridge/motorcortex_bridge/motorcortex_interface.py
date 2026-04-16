@@ -43,30 +43,16 @@ TORQUE_ACTUAL_PATH_FMT  = (                                             # 실제
     '/actuatorControlLoop{:02d}/actuatorTorqueActual'
 )
 # ── 이벤트 경로 (GRID UserParameters) ──────────────────────────────────────────
-# [leg_test 이벤트]
-CONTROL_MODE_PATH   = 'root/UserParameters/controlMode'
-JUMP_EVENT_PATH    = 'root/UserParameters/jump'     # 점프 궤적 실행
-HOME_EVENT_PATH    = 'root/UserParameters/home'     # 홈 복귀
-MOVE_L_EVENT_PATH  = 'root/UserParameters/moveL'     # moveL
-FORCE_S_EVENT_PATH = 'root/UserParameters/forceS'     # forceS
-FORCE_T_EVENT_PATH = 'root/UserParameters/forceT'     # forceT
-GAIT_EVENT_PATH    = 'root/UserParameters/gait'     # gait
-# [connect 하위 모드 이벤트] — 경로는 추후 변경 예정
-CONNECT_MODE_PATH   = 'root/UserParameters/connectMode'
-STANDBY_EVENT_PATH = 'root/UserParameters/standby'     # standby 복귀
-RL_EVENT_PATH      = 'root/UserParameters/RL'     # RL 모드 시작
-MPC_EVENT_PATH     = 'root/UserParameters/MPC'     # MPC 모드 시작 (추후 구현)
-
-# ── 제어 모드 값 (controlMode) ─────────────────────────────────────────────────
-#   0 = action   : Standby (디폴트) / RL / MPC 이벤트 대기
-#   1 = leg_test : jump / home / moveL / force / gait 이벤트 처리
-CTRL_MODE_CONNECT   = 0
-CTRL_MODE_LEG_TEST = 1
-
-# ── connect 하위 모드 ───────────────────────────────────────────────────────────
-CONNECT_STANDBY = 0   # 현재 위치 유지 (디폴트)
-CONNECT_RL      = 1   # 외부 low_cmd 추종 (50Hz → 200Hz 보간)
-CONNECT_MPC     = 2   # 추후 구현
+JUMP_EVENT_PATH          = 'root/UserParameters/jump'
+HOME_EVENT_PATH          = 'root/UserParameters/home'
+MOVE_L_EVENT_PATH        = 'root/UserParameters/moveL'
+FORCE_S_EVENT_PATH       = 'root/UserParameters/forceS'
+FORCE_T_EVENT_PATH       = 'root/UserParameters/forceT'
+GAIT_EVENT_PATH          = 'root/UserParameters/gait'
+SITTING_EVENT_PATH       = 'root/UserParameters/Sitting'
+STANDING_EVENT_PATH      = 'root/UserParameters/Standing'
+RL_TROT_EVENT_PATH       = 'root/UserParameters/RL_trot'
+FALL_RECOVERY_EVENT_PATH = 'root/UserParameters/Fall recovery'
 
 # ── 조인트 매핑: (ROS joint name, ch index) ───────────────────────────────────
 #   ch0 = HL_joint2_thigh_r
@@ -299,37 +285,30 @@ class MotorcortexInterface:
     def reset_gait_event(self):
         self._reset_event(GAIT_EVENT_PATH)
 
-    # ── connect 하위 모드 이벤트 구독 / 리셋 ──────────────────────────────────
-    def subscribe_standby_event(self, cb: callable):
-        self._subscribe_event(STANDBY_EVENT_PATH, 'standby_group', cb)
+    # ── 자세/모드 이벤트 구독 / 리셋 ────────────────────────────────────────────
+    def subscribe_sitting_event(self, cb: callable):
+        self._subscribe_event(SITTING_EVENT_PATH, 'sitting_group', cb)
 
-    def reset_standby_event(self):
-        self._reset_event(STANDBY_EVENT_PATH)
+    def reset_sitting_event(self):
+        self._reset_event(SITTING_EVENT_PATH)
 
-    def subscribe_rl_event(self, cb: callable):
-        self._subscribe_event(RL_EVENT_PATH, 'rl_group', cb)
+    def subscribe_standing_event(self, cb: callable):
+        self._subscribe_event(STANDING_EVENT_PATH, 'standing_group', cb)
 
-    def reset_rl_event(self):
-        self._reset_event(RL_EVENT_PATH)
+    def reset_standing_event(self):
+        self._reset_event(STANDING_EVENT_PATH)
 
-    def subscribe_mpc_event(self, cb: callable):
-        self._subscribe_event(MPC_EVENT_PATH, 'mpc_group', cb)
+    def subscribe_rl_trot_event(self, cb: callable):
+        self._subscribe_event(RL_TROT_EVENT_PATH, 'rl_trot_group', cb)
 
-    def reset_mpc_event(self):
-        self._reset_event(MPC_EVENT_PATH)
+    def reset_rl_trot_event(self):
+        self._reset_event(RL_TROT_EVENT_PATH)
 
-    # ── controlMode 구독 ──────────────────────────────────────────────────────
-    def subscribe_control_mode(self, on_mode_change: callable):
-        sub = self._sub.subscribe([CONTROL_MODE_PATH], 'ctrl_mode_group', frq_divider=1)
+    def subscribe_fall_recovery_event(self, cb: callable):
+        self._subscribe_event(FALL_RECOVERY_EVENT_PATH, 'fall_recovery_group', cb)
 
-        def _cb(msg):
-            if msg and msg[0].value:
-                raw = int(msg[0].value[0])
-                mode = raw if raw in (CTRL_MODE_CONNECT, CTRL_MODE_LEG_TEST) else CTRL_MODE_CONNECT
-                on_mode_change(mode)
-
-        sub.notify(_cb)
-        self._subs.append(sub)
+    def reset_fall_recovery_event(self):
+        self._reset_event(FALL_RECOVERY_EVENT_PATH)
 
     # ── JogMode / PauseMode 동시 0 구독 ──────────────────────────────────────
     def subscribe_idle_mode(self, on_idle: callable, on_busy: callable = None):

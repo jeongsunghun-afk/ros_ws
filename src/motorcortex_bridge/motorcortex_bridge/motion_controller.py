@@ -1,40 +1,35 @@
 """
 motion_controller.py
-궤적 실행 / moveJ / moveL / forceS / forceT / 제어 루프 / 제어 모드 처리 전담 클래스
+궤적 실행 / moveJ / moveL / forceS / forceT / 제어 루프 / 이벤트 처리 전담 클래스
 ROS2 의존성 없음 — joint_state_bridge 에서 생성하여 사용
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-제어 모드 (GRID root/UserParameters/controlMode)
+동작 흐름 (JogMode=0 & PauseMode=0 진입 후)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  0 = standby  — 마지막 위치 유지 (기본)
-  1 = MPC      — 내부 MPC 계산 (추후 구현)
-  2 = RL       — 외부 RL 명령 추종, 50Hz → 200Hz 선형 보간
-  3 = leg_test — 다리 테스트 모드 (이벤트로 동작 트리거)
-  그 외 값     → standby로 처리
+  [정상 운용 시퀀스]
+    Sitting → Standing → RL_trot
+    Fall Recovery → Sitting 복귀
+
+  [Leg_test 이벤트]
+    Jump, Gait, moveL, ForceT, ForceS
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-이벤트 트리거 (GRID root/UserParameters/*)
+이벤트 경로 (GRID root/UserParameters/*)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  JumpEvent   — 점프 궤적 실행 (.txt)
-  HomeEvent   — 홈 복귀
-  moveLEvent  — moveL (PD 위치 제어, Cartesian)  [leg_test]
-  ForceSEvent — forceS (정적 임피던스 I.C.)       [leg_test]
-  ForceTEvent — forceT (GRF 궤적 임피던스)        [leg_test]
-  GaitEvent   — gait (보행 궤적)                 [leg_test, 추후 구현]
-
-  * moveJ 는 이벤트 없이 직접 호출 메서드로 제공
+  Sitting       — sitting 자세 전환
+  Standing      — standing 자세 전환
+  RL_trot       — RL 명령 추종 (50Hz → 200Hz 선형 보간)
+  Fall recovery — 낙상 복구
+  jump          — 점프 궤적 실행 (.txt)
+  gait          — 보행 궤적 (추후 구현)
+  moveL         — Cartesian 직선 이동
+  forceS        — 정적 임피던스 제어
+  forceT        — GRF 궤적 임피던스 제어
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RL 보간 (RL 모드):
+RL_trot 보간:
   interp_q[i] = prev[i] + t * (target[i] - prev[i])   t ∈ [0, 1]
   t = elapsed / CMD_PERIOD   (CMD_PERIOD = 1/50Hz = 0.02s)
-
-Unitree LowCmd 매핑:
-  motorCmd[i].q   → target joint position  [rad]
-  motorCmd[i].dq  → target joint velocity  [rad/s]  (시뮬레이터 미지원 → 무시)
-  motorCmd[i].Kp  → position gain          (시뮬레이터 미지원 → 무시)
-  motorCmd[i].Kd  → velocity gain          (시뮬레이터 미지원 → 무시)
-  motorCmd[i].tau → feedforward torque     [Nm]      (시뮬레이터 미지원 → 무시)
 """
 
 import threading
@@ -45,11 +40,6 @@ import numpy as np
 from motorcortex_bridge.motorcortex_interface import (
     MotorcortexInterface,
     N_AXES,
-    CTRL_MODE_CONNECT,
-    CTRL_MODE_LEG_TEST,
-    CONNECT_STANDBY,
-    CONNECT_RL,
-    CONNECT_MPC,
 )
 
 # ── 홈 자세 ────────────────────────────────────────────────────────────────────
@@ -387,13 +377,10 @@ class MotionController:
         self._ctrl_ready = False
         self._in_movel   = False
 
-        # 제어 모드 (GRID controlMode 동기화)
-        # 0=connect, 1=leg_test
-        self._ctrl_mode      = CTRL_MODE_CONNECT
-        # connect 하위 모드: 0=standby, 1=RL, 2=MPC
-        self._connect_sub_mode = CONNECT_STANDBY
+        # RL trot 활성 여부 (True 시 _interp_loop 에서 보간 실행)
+        self._rl_trot_active = False
 
-        # 마지막 명령 위치 (standby / publish 참조용)
+        # 마지막 명령 위치 (위치 유지 / publish 참조용)
         self._last_cmd_pos = list(Q_HOME_RAD)
 
         # ── tracking 모드: 선형 보간 상태 ─────────────────────────────────
@@ -408,18 +395,17 @@ class MotionController:
         self._cmd_tau = [0.0]  * N_AXES
 
         # 이벤트 트리거 (GRID → Python Event)
-        self._idle_ev    = threading.Event()   # JogMode=0 & PauseMode=0 전환
-        # [connect 하위 모드 이벤트]
-        self._standby_ev = threading.Event()   # standby 복귀
-        self._rl_ev      = threading.Event()   # RL 모드 시작
-        self._mpc_ev     = threading.Event()   # MPC 모드 시작
-        # [leg_test 이벤트]
-        self._jump_ev    = threading.Event()   # JumpEvent
-        self._home_ev    = threading.Event()   # HomeEvent
-        self._movel_ev   = threading.Event()   # moveLEvent
-        self._force_s_ev = threading.Event()   # ForceSEvent
-        self._force_t_ev = threading.Event()   # ForceTEvent
-        self._gait_ev    = threading.Event()   # GaitEvent
+        self._idle_ev          = threading.Event()   # JogMode=0 & PauseMode=0 전환
+        # [자세/액션 이벤트]
+        self._sitting_ev       = threading.Event()   # Sitting 자세 전환
+        self._standing_ev      = threading.Event()   # Standing 자세 전환
+        self._fall_recovery_ev = threading.Event()   # Fall Recovery
+        self._jump_ev          = threading.Event()   # 점프 궤적
+        self._home_ev          = threading.Event()   # 홈 복귀
+        self._movel_ev         = threading.Event()   # moveL
+        self._force_s_ev       = threading.Event()   # forceS
+        self._force_t_ev       = threading.Event()   # forceT
+        self._gait_ev          = threading.Event()   # Gait
 
         # moveL 목표 좌표 (힙 원점 기준, [m])  — 외부에서 set_movel_target()으로 설정
         self._movel_target: list = None   # (Px, Py, Pz)  or  [(Px,Py,Pz), ...]
@@ -441,29 +427,6 @@ class MotionController:
     @property
     def ctrl_mode(self) -> int:
         return self._ctrl_mode
-
-    # ── 제어 모드 전환 (GRID controlMode 구독 콜백에서 호출) ─────────────────────
-    def set_control_mode(self, mode: int):
-        """
-        GRID controlMode 값으로 상위 모드 전환.
-          0 = action   : Standby / RL / MPC 하위 모드 (기본: Standby)
-          1 = leg_test : jump / home / moveL / force / gait 이벤트 처리
-          그 외        → action(0)
-        """
-        if mode not in (CTRL_MODE_CONNECT, CTRL_MODE_LEG_TEST):
-            mode = CTRL_MODE_CONNECT
-        with self._lock:
-            self._ctrl_mode = mode
-
-    def set_connect_sub_mode(self, sub_mode: int):
-        """
-        action 모드 하위 모드 전환.
-          0 = standby : 현재 위치 유지
-          1 = RL      : 외부 low_cmd 추종
-          2 = MPC     : 추후 구현
-        """
-        with self._lock:
-            self._connect_sub_mode = sub_mode
 
     # ── moveL 목표 좌표 설정 ──────────────────────────────────────────────────
     def set_movel_target(self, target):
@@ -498,6 +461,10 @@ class MotionController:
         self._waypoints = waypoints
         time.sleep(0.01)
         # 이전 세션에서 남은 값 초기화 (구독 전 리셋 — 초기값 즉시 발화 방지)
+        self._mcx.reset_sitting_event()
+        self._mcx.reset_standing_event()
+        self._mcx.reset_rl_trot_event()
+        self._mcx.reset_fall_recovery_event()
         self._mcx.reset_jump_event()
         self._mcx.reset_home_event()
         self._mcx.reset_movel_event()
@@ -507,11 +474,12 @@ class MotionController:
 
         # 이벤트 구독
         self._mcx.subscribe_idle_mode(self._on_idle_mode, self._on_busy_mode)
-        # [connect 하위 모드 이벤트]
-        self._mcx.subscribe_standby_event(self._on_standby)
-        self._mcx.subscribe_rl_event(self._on_rl)
-        self._mcx.subscribe_mpc_event(self._on_mpc)
-        # [leg_test 이벤트]
+        # [자세/모드 이벤트]
+        self._mcx.subscribe_sitting_event(self._on_sitting)
+        self._mcx.subscribe_standing_event(self._on_standing)
+        self._mcx.subscribe_rl_trot_event(self._on_rl_trot)
+        self._mcx.subscribe_fall_recovery_event(self._on_fall_recovery)
+        # [액션 이벤트]
         self._mcx.subscribe_jump_event(self._on_jump)
         self._mcx.subscribe_home_event(self._on_home)
         self._mcx.subscribe_movel_event(self._on_movel)
@@ -539,14 +507,27 @@ class MotionController:
         self._idle_ev.clear()
         self._ctrl_ready = False
 
-    def _on_standby(self):
-        self._standby_ev.set()
+    def _on_sitting(self):
+        """Sitting 이벤트 → RL trot 비활성, sitting 동작 트리거."""
+        self._rl_trot_active = False
+        self._sitting_ev.set()
+        self._mcx.reset_sitting_event()
 
-    def _on_rl(self):
-        self._rl_ev.set()
+    def _on_standing(self):
+        """Standing 이벤트 → RL trot 비활성, standing 동작 트리거."""
+        self._rl_trot_active = False
+        self._standing_ev.set()
+        self._mcx.reset_standing_event()
 
-    def _on_mpc(self):
-        self._mpc_ev.set()
+    def _on_rl_trot(self):
+        """RL_trot 이벤트 → 보간 모드 활성."""
+        self._rl_trot_active = True
+        self._mcx.reset_rl_trot_event()
+
+    def _on_fall_recovery(self):
+        """Fall Recovery 이벤트 → 뼈대 (상세 구현 추후)."""
+        self._fall_recovery_ev.set()
+        self._mcx.reset_fall_recovery_event()
 
     def _on_jump(self):
         if not self._in_movel:
@@ -582,122 +563,83 @@ class MotionController:
                 if log_cb:
                     log_cb('제어권 획득 — 이벤트 수신 대기 중')
 
-            with self._lock:
-                mode     = self._ctrl_mode
-                sub_mode = self._connect_sub_mode
+            # ── [정상 운용] Sitting ─────────────────────────────────────────────
+            if self._sitting_ev.is_set():
+                self._sitting_ev.clear()
+                if log_cb:
+                    log_cb('Sitting: 자세 전환 (TODO)')
+                # TODO: sitting 자세 궤적 실행
 
-            # ── LEG_TEST 모드: 이벤트 처리 ───────────────────────────────────
-            if mode == CTRL_MODE_LEG_TEST:
-                # JumpEvent
-                jump_triggered = self._jump_ev.wait(timeout=0.05)
-                if jump_triggered:
-                    self._in_movel = True
-                    self._jump_ev.clear()
-                    self._mcx.reset_jump_event()
-                    self._jump_ev.clear()
-                    if log_cb:
-                        log_cb('JumpEvent: 점프 궤적 실행')
-                    self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb)
-                    if log_cb:
-                        log_cb('jump 완료. 다음 이벤트 대기 중...')
+            # ── [정상 운용] Standing ────────────────────────────────────────────
+            elif self._standing_ev.is_set():
+                self._standing_ev.clear()
+                if log_cb:
+                    log_cb('Standing: 자세 전환 (TODO)')
+                # TODO: standing 자세 궤적 실행
 
-                # HomeEvent
-                if self._home_ev.is_set():
-                    self._home_ev.clear()
-                    time.sleep(0.01)
-                    self._mcx.reset_home_event()
-                    self._home_ev.clear()
-                    if log_cb:
-                        log_cb('HomeEvent: 홈 복귀 실행')
-                    self.move_to_home(log_cb=log_cb)
-                    if log_cb:
-                        log_cb('홈 복귀 완료')
+            # ── [정상 운용] Fall Recovery (→ Sitting 복귀) ─────────────────────
+            elif self._fall_recovery_ev.is_set():
+                self._fall_recovery_ev.clear()
+                self._rl_trot_active = False
+                if log_cb:
+                    log_cb('Fall Recovery: 낙상 복구 (TODO)')
+                # TODO: fall recovery 궤적 실행
 
-                # moveLEvent
-                if self._movel_ev.is_set():
-                    self._movel_ev.clear()
-                    self._mcx.reset_movel_event()
-                    actual_j = self._mcx.actual_positions
-                    fk_pts   = forward_kinematics(actual_j)
-                    p_cur    = fk_pts[-1].tolist()
-                    target   = [(p_cur[0] - 0.01, p_cur[1], p_cur[2])]
-                    if log_cb:
-                        log_cb(
-                            f'moveLEvent: moveL 실행 '
-                            f'({p_cur[0]*1000:.1f}, {p_cur[1]*1000:.1f}, {p_cur[2]*1000:.1f}) mm'
-                            f' → ({target[0][0]*1000:.1f}, {target[0][1]*1000:.1f}, {target[0][2]*1000:.1f}) mm'
-                        )
-                    self.move_l(target, log_cb=log_cb)
+            # ── [Leg_test] Jump ─────────────────────────────────────────────────
+            elif self._jump_ev.wait(timeout=0.01):
+                self._in_movel = True
+                self._jump_ev.clear()
+                self._mcx.reset_jump_event()
+                if log_cb:
+                    log_cb('Jump: 점프 궤적 실행')
+                self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb)
+                if log_cb:
+                    log_cb('jump 완료.')
 
-                # ForceSEvent
-                if self._force_s_ev.is_set():
-                    self._force_s_ev.clear()
-                    self._mcx.reset_force_s_event()
-                    if log_cb:
-                        log_cb('ForceSEvent: 정적 임피던스 제어 시작')
-                    self._run_force_s(log_cb=log_cb)
+            # ── [Leg_test] Gait ─────────────────────────────────────────────────
+            elif self._gait_ev.is_set():
+                self._gait_ev.clear()
+                self._mcx.reset_gait_event()
+                if log_cb:
+                    log_cb('Gait: 보행 궤적 실행 (TODO)')
+                # TODO: GaitController 연동
 
-                # ForceTEvent
-                if self._force_t_ev.is_set():
-                    self._force_t_ev.clear()
-                    self._mcx.reset_force_t_event()
-                    if log_cb:
-                        log_cb('ForceTEvent: GRF 궤적 임피던스 제어 시작')
-                    self._run_force_t(log_cb=log_cb)
-                    if log_cb:
-                        log_cb('forceT 완료. 다음 이벤트 대기 중...')
+            # ── [Leg_test] moveL ────────────────────────────────────────────────
+            elif self._movel_ev.is_set():
+                self._movel_ev.clear()
+                self._mcx.reset_movel_event()
+                actual_j = self._mcx.actual_positions
+                fk_pts   = forward_kinematics(actual_j)
+                p_cur    = fk_pts[-1].tolist()
+                target   = [(p_cur[0] - 0.01, p_cur[1], p_cur[2])]
+                if log_cb:
+                    log_cb(
+                        f'moveL: 실행 '
+                        f'({p_cur[0]*1000:.1f},{p_cur[1]*1000:.1f},{p_cur[2]*1000:.1f})mm'
+                        f' → ({target[0][0]*1000:.1f},{target[0][1]*1000:.1f},{target[0][2]*1000:.1f})mm'
+                    )
+                self.move_l(target, log_cb=log_cb)
 
-                # GaitEvent
-                if self._gait_ev.is_set():
-                    self._gait_ev.clear()
-                    self._mcx.reset_gait_event()
-                    if log_cb:
-                        log_cb('GaitEvent: 보행 궤적 실행 (미구현)')
-                    # TODO: GaitController 연동
+            # ── [Leg_test] ForceT ───────────────────────────────────────────────
+            elif self._force_t_ev.is_set():
+                self._force_t_ev.clear()
+                self._mcx.reset_force_t_event()
+                if log_cb:
+                    log_cb('ForceT: GRF 궤적 임피던스 제어 시작')
+                self._run_force_t(log_cb=log_cb)
+                if log_cb:
+                    log_cb('forceT 완료.')
 
-            # ── ACTION 모드: 이벤트 기반 하위 모드 전환 ─────────────────────
-            elif mode == CTRL_MODE_CONNECT:
+            # ── [Leg_test] ForceS ───────────────────────────────────────────────
+            elif self._force_s_ev.is_set():
+                self._force_s_ev.clear()
+                self._mcx.reset_force_s_event()
+                if log_cb:
+                    log_cb('ForceS: 정적 임피던스 제어 시작')
+                self._run_force_s(log_cb=log_cb)
 
-                # RL 이벤트
-                if self._rl_ev.is_set():
-                    self._rl_ev.clear()
-                    self._mcx.reset_rl_event()
-                    with self._lock:
-                        self._connect_sub_mode = CONNECT_RL
-                    if log_cb:
-                        log_cb('CONNECT: RL 모드 시작 — standby 이벤트 대기')
-                    # standby 이벤트 수신까지 RL 모드 유지
-                    self._standby_ev.wait()
-                    self._standby_ev.clear()
-                    self._mcx.reset_standby_event()
-                    with self._lock:
-                        self._connect_sub_mode = CONNECT_STANDBY
-                    if log_cb:
-                        log_cb('CONNECT: Standby 복귀')
-
-                # MPC 이벤트
-                elif self._mpc_ev.is_set():
-                    self._mpc_ev.clear()
-                    self._mcx.reset_mpc_event()
-                    with self._lock:
-                        self._connect_sub_mode = CONNECT_MPC
-                    if log_cb:
-                        log_cb('CONNECT: MPC 모드 시작 (미구현) — standby 이벤트 대기')
-                    # TODO: MPC 구현
-                    self._standby_ev.wait()
-                    self._standby_ev.clear()
-                    self._mcx.reset_standby_event()
-                    with self._lock:
-                        self._connect_sub_mode = CONNECT_STANDBY
-                    if log_cb:
-                        log_cb('CONNECT: Standby 복귀')
-
-                # STANDBY (디폴트): 위치 유지 → _interp_loop 에서 처리
-                else:
-                    if self._standby_ev.is_set():
-                        self._standby_ev.clear()
-                        self._mcx.reset_standby_event()
-                    time.sleep(0.01)
+            else:
+                time.sleep(0.01)
 
     # ── forceS: 정적 임피던스 제어 루프 ──────────────────────────────────────
     def _run_force_s(self, log_cb=None):
@@ -1117,19 +1059,16 @@ class MotionController:
                 mode     = self._ctrl_mode
                 sub_mode = self._connect_sub_mode
 
-                if mode == CTRL_MODE_CONNECT and sub_mode == CONNECT_RL:
-                    # RL 명령 추종: prev → target 선형 보간 (50Hz → 200Hz)
+                if self._rl_trot_active:
+                    # RL_trot: 외부 low_cmd 추종 — prev → target 선형 보간 (50Hz → 200Hz)
                     elapsed = time.monotonic() - self._interp_time
                     t = min(elapsed / CMD_PERIOD, 1.0)
                     positions = [
                         self._interp_prev[i] + t * (self._interp_target[i] - self._interp_prev[i])
                         for i in range(N_AXES)
                     ]
-                elif mode == CTRL_MODE_CONNECT and sub_mode == CONNECT_MPC:
-                    # TODO: MPC 계산 구현
-                    positions = list(self._last_cmd_pos)
                 else:
-                    # standby / leg_test: 마지막 명령 위치 유지
+                    # Sitting / Standing / Leg_test: 마지막 명령 위치 유지
                     positions = list(self._last_cmd_pos)
 
             try:

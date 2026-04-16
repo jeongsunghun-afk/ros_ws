@@ -121,7 +121,6 @@ class JointStateBridge(Node):
 
                 self._mcx.subscribe_positions()
                 self._mcx.subscribe_torque_actual()
-                self._mcx.subscribe_control_mode(self._on_control_mode)
 
                 actual = self._mcx.get_actual_positions_snapshot()
                 self._mcx.set_base_pos(actual)           # additive 기준점 저장
@@ -143,12 +142,6 @@ class JointStateBridge(Node):
             except Exception as e:
                 self.get_logger().error(f'연결 실패: {e} — 5초 후 재시도')
                 time.sleep(5)
-
-    # ── controlMode 변경 콜백 ─────────────────────────────────────────────────
-    def _on_control_mode(self, mode: int):
-        mode_names = {0: 'standby', 1: 'MPC', 2: 'RL', 3: 'leg_test'}
-        self.get_logger().info(f'controlMode → {mode} ({mode_names.get(mode, "standby")})')
-        self._ctrl.set_control_mode(mode)
 
     # ── /low_cmd 구독 콜백 ────────────────────────────────────────────────────
     def _on_low_cmd(self, msg: JointState):
