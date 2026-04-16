@@ -632,24 +632,16 @@ class MotionController:
             elif self._movel_ev.is_set():
                 self._movel_ev.clear()
 
-                # ── 실제 관절값 기준으로 직교 좌표 계산 ─────────────────────
-                # 1) MCX actual (home offset) 읽기 → 물리각 변환 → FK → 발끝 위치
+                # MCX actual → 물리각 → FK·phi 계산
+                # _last_cmd_pos는 MCX 단위 유지 (move_l 내부에서 _to_phy 변환)
                 actual_j_mcx = self._mcx.actual_positions
-                actual_j_phy = _to_phy(actual_j_mcx)          # home offset → 물리각
+                actual_j_phy = _to_phy(actual_j_mcx)
                 p_cur        = forward_kinematics(actual_j_phy)[-1].tolist()
-
-                # 2) phi (발끝 자세각 θ2+θ3+θ4) = 물리각 기준
-                phi = actual_j_phy[1] + actual_j_phy[2] + actual_j_phy[3]
-
-                # 3) move_l 시작점(last_cmd_pos)을 MCX actual로 동기화
-                #    (move_l 내부에서 _to_phy 변환 후 FK 수행하므로 MCX 단위 유지)
+                phi          = actual_j_phy[1] + actual_j_phy[2] + actual_j_phy[3]
                 with self._lock:
                     self._last_cmd_pos = list(actual_j_mcx)
 
-                # 4) 직교 좌표 기준 궤적 정의
-                #   p_start : 현재 발끝에서 +x 20mm (전진 시작점)
-                #   p_peak  : x 중간, z +30mm (스텝 최고점)
-                #   p_end   : 현재 발끝에서 −x 20mm (착지점)
+                # step 궤적: 발끝 +20mm(x) → 최고점(z+30mm) → -20mm(x)
                 p_start = (p_cur[0] + MOVEL_STEP_X, p_cur[1], p_cur[2]              )
                 p_peak  = (p_cur[0],                 p_cur[1], p_cur[2] + MOVEL_STEP_H)
                 p_end   = (p_cur[0] - MOVEL_STEP_X, p_cur[1], p_cur[2]              )
@@ -661,8 +653,6 @@ class MotionController:
                         f' → peak=({p_peak[0]*1e3:.1f},{p_peak[2]*1e3:.1f})mm'
                         f' → end=({p_end[0]*1e3:.1f},{p_end[2]*1e3:.1f})mm'
                     )
-
-                # 5) Cartesian 궤적 → IK → 관절각 배열 → MCX 전송 (move_l 내부 처리)
                 self.move_l([p_start, p_peak, p_end], phi=phi, log_cb=log_cb)
                 self._in_movel = True
                 self._mcx.reset_movel_event()
@@ -730,7 +720,7 @@ class MotionController:
             k  = 0
             while not (self._home_ev.is_set() or self._jump_ev.is_set()):
                 q_now_phy      = _to_phy(self._mcx.actual_positions)
-                x_a, J, tau_g  = _compute_kinematics(q_now_phy)   # 물리각 기준 DH
+                x_a, J, tau_g  = _compute_kinematics(q_now_phy)
 
                 dx_a     = (x_a - x_a_prev) / dt              # 발끝 속도 추정
                 x_a_prev = x_a.copy()
@@ -750,8 +740,7 @@ class MotionController:
 
         finally:
             self._mcx.set_target_torques([0.0] * N_AXES)
-            # _in_movel=True 상태에서 MCX 리셋 후 버퍼 드레인
-            self._home_ev.clear()
+            # _in_movel=True 게이트 유지 → reset → 50ms 드레인 → clear → 해제
             self._mcx.reset_home_event()
             self._mcx.reset_force_s_event()
             time.sleep(0.05)
@@ -847,8 +836,7 @@ class MotionController:
 
         finally:
             self._mcx.set_target_torques([0.0] * N_AXES)
-            # _in_movel=True 상태에서 MCX 리셋 후 버퍼 드레인
-            self._home_ev.clear()
+            # _in_movel=True 게이트 유지 → reset → 50ms 드레인 → clear → 해제
             self._mcx.reset_home_event()
             self._mcx.reset_force_t_event()
             time.sleep(0.05)
@@ -984,6 +972,7 @@ class MotionController:
 
         all_cart = [p_start] + [list(wp) for wp in cartesian_waypoints]
         dense_j  = []   # MCX offset 단위로 저장
+        prev_phy = current_j_phy  # IK 연속성용 — 세그먼트 간 round-trip 없이 직접 추적
 
         for seg_i in range(len(all_cart) - 1):
             p0 = np.array(all_cart[seg_i])
@@ -991,7 +980,6 @@ class MotionController:
             dist = float(np.linalg.norm(pf - p0))
             n = max(1, int(dist / (MOVEL_VEL * dt)))
 
-            prev_phy = current_j_phy if seg_i == 0 else _to_phy(dense_j[-1])
             for k in range(1, n + 1):
                 t = k / n
                 pt = p0 + t * (pf - p0)
