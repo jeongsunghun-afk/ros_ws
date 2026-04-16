@@ -45,11 +45,11 @@ import numpy as np
 from motorcortex_bridge.motorcortex_interface import (
     MotorcortexInterface,
     N_AXES,
-    CTRL_MODE_ACTION,
+    CTRL_MODE_CONNECT,
     CTRL_MODE_LEG_TEST,
-    ACTION_STANDBY,
-    ACTION_RL,
-    ACTION_MPC,
+    CONNECT_STANDBY,
+    CONNECT_RL,
+    CONNECT_MPC,
 )
 
 # ── 홈 자세 ────────────────────────────────────────────────────────────────────
@@ -388,10 +388,10 @@ class MotionController:
         self._in_movel   = False
 
         # 제어 모드 (GRID controlMode 동기화)
-        # 0=action, 1=leg_test
-        self._ctrl_mode      = CTRL_MODE_ACTION
-        # action 하위 모드: 0=standby, 1=RL, 2=MPC
-        self._action_sub_mode = ACTION_STANDBY
+        # 0=connect, 1=leg_test
+        self._ctrl_mode      = CTRL_MODE_CONNECT
+        # connect 하위 모드: 0=standby, 1=RL, 2=MPC
+        self._connect_sub_mode = CONNECT_STANDBY
 
         # 마지막 명령 위치 (standby / publish 참조용)
         self._last_cmd_pos = list(Q_HOME_RAD)
@@ -409,7 +409,7 @@ class MotionController:
 
         # 이벤트 트리거 (GRID → Python Event)
         self._idle_ev    = threading.Event()   # JogMode=0 & PauseMode=0 전환
-        # [action 하위 모드 이벤트]
+        # [connect 하위 모드 이벤트]
         self._standby_ev = threading.Event()   # standby 복귀
         self._rl_ev      = threading.Event()   # RL 모드 시작
         self._mpc_ev     = threading.Event()   # MPC 모드 시작
@@ -450,12 +450,12 @@ class MotionController:
           1 = leg_test : jump / home / moveL / force / gait 이벤트 처리
           그 외        → action(0)
         """
-        if mode not in (CTRL_MODE_ACTION, CTRL_MODE_LEG_TEST):
-            mode = CTRL_MODE_ACTION
+        if mode not in (CTRL_MODE_CONNECT, CTRL_MODE_LEG_TEST):
+            mode = CTRL_MODE_CONNECT
         with self._lock:
             self._ctrl_mode = mode
 
-    def set_action_sub_mode(self, sub_mode: int):
+    def set_connect_sub_mode(self, sub_mode: int):
         """
         action 모드 하위 모드 전환.
           0 = standby : 현재 위치 유지
@@ -463,7 +463,7 @@ class MotionController:
           2 = MPC     : 추후 구현
         """
         with self._lock:
-            self._action_sub_mode = sub_mode
+            self._connect_sub_mode = sub_mode
 
     # ── moveL 목표 좌표 설정 ──────────────────────────────────────────────────
     def set_movel_target(self, target):
@@ -507,7 +507,7 @@ class MotionController:
 
         # 이벤트 구독
         self._mcx.subscribe_idle_mode(self._on_idle_mode, self._on_busy_mode)
-        # [action 하위 모드 이벤트]
+        # [connect 하위 모드 이벤트]
         self._mcx.subscribe_standby_event(self._on_standby)
         self._mcx.subscribe_rl_event(self._on_rl)
         self._mcx.subscribe_mpc_event(self._on_mpc)
@@ -584,7 +584,7 @@ class MotionController:
 
             with self._lock:
                 mode     = self._ctrl_mode
-                sub_mode = self._action_sub_mode
+                sub_mode = self._connect_sub_mode
 
             # ── LEG_TEST 모드: 이벤트 처리 ───────────────────────────────────
             if mode == CTRL_MODE_LEG_TEST:
@@ -656,41 +656,41 @@ class MotionController:
                     # TODO: GaitController 연동
 
             # ── ACTION 모드: 이벤트 기반 하위 모드 전환 ─────────────────────
-            elif mode == CTRL_MODE_ACTION:
+            elif mode == CTRL_MODE_CONNECT:
 
                 # RL 이벤트
                 if self._rl_ev.is_set():
                     self._rl_ev.clear()
                     self._mcx.reset_rl_event()
                     with self._lock:
-                        self._action_sub_mode = ACTION_RL
+                        self._connect_sub_mode = CONNECT_RL
                     if log_cb:
-                        log_cb('ACTION: RL 모드 시작 — standby 이벤트 대기')
+                        log_cb('CONNECT: RL 모드 시작 — standby 이벤트 대기')
                     # standby 이벤트 수신까지 RL 모드 유지
                     self._standby_ev.wait()
                     self._standby_ev.clear()
                     self._mcx.reset_standby_event()
                     with self._lock:
-                        self._action_sub_mode = ACTION_STANDBY
+                        self._connect_sub_mode = CONNECT_STANDBY
                     if log_cb:
-                        log_cb('ACTION: Standby 복귀')
+                        log_cb('CONNECT: Standby 복귀')
 
                 # MPC 이벤트
                 elif self._mpc_ev.is_set():
                     self._mpc_ev.clear()
                     self._mcx.reset_mpc_event()
                     with self._lock:
-                        self._action_sub_mode = ACTION_MPC
+                        self._connect_sub_mode = CONNECT_MPC
                     if log_cb:
-                        log_cb('ACTION: MPC 모드 시작 (미구현) — standby 이벤트 대기')
+                        log_cb('CONNECT: MPC 모드 시작 (미구현) — standby 이벤트 대기')
                     # TODO: MPC 구현
                     self._standby_ev.wait()
                     self._standby_ev.clear()
                     self._mcx.reset_standby_event()
                     with self._lock:
-                        self._action_sub_mode = ACTION_STANDBY
+                        self._connect_sub_mode = CONNECT_STANDBY
                     if log_cb:
-                        log_cb('ACTION: Standby 복귀')
+                        log_cb('CONNECT: Standby 복귀')
 
                 # STANDBY (디폴트): 위치 유지 → _interp_loop 에서 처리
                 else:
@@ -1115,9 +1115,9 @@ class MotionController:
 
             with self._lock:
                 mode     = self._ctrl_mode
-                sub_mode = self._action_sub_mode
+                sub_mode = self._connect_sub_mode
 
-                if mode == CTRL_MODE_ACTION and sub_mode == ACTION_RL:
+                if mode == CTRL_MODE_CONNECT and sub_mode == CONNECT_RL:
                     # RL 명령 추종: prev → target 선형 보간 (50Hz → 200Hz)
                     elapsed = time.monotonic() - self._interp_time
                     t = min(elapsed / CMD_PERIOD, 1.0)
@@ -1125,7 +1125,7 @@ class MotionController:
                         self._interp_prev[i] + t * (self._interp_target[i] - self._interp_prev[i])
                         for i in range(N_AXES)
                     ]
-                elif mode == CTRL_MODE_ACTION and sub_mode == ACTION_MPC:
+                elif mode == CTRL_MODE_CONNECT and sub_mode == CONNECT_MPC:
                     # TODO: MPC 계산 구현
                     positions = list(self._last_cmd_pos)
                 else:

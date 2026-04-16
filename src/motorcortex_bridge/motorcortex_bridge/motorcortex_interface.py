@@ -52,7 +52,7 @@ MOVE_L_EVENT_PATH  = 'root/UserParameters/stopmode'     # moveL
 FORCE_S_EVENT_PATH = 'root/UserParameters/stopmode'     # forceS
 FORCE_T_EVENT_PATH = 'root/UserParameters/stopmode'     # forceT
 GAIT_EVENT_PATH    = 'root/UserParameters/stopmode'     # gait
-# [action 하위 모드 이벤트] — 경로는 추후 변경 예정
+# [connect 하위 모드 이벤트] — 경로는 추후 변경 예정
 STANDBY_EVENT_PATH = 'root/UserParameters/stopmode'     # standby 복귀
 RL_EVENT_PATH      = 'root/UserParameters/stopmode'     # RL 모드 시작
 MPC_EVENT_PATH     = 'root/UserParameters/stopmode'     # MPC 모드 시작 (추후 구현)
@@ -60,13 +60,13 @@ MPC_EVENT_PATH     = 'root/UserParameters/stopmode'     # MPC 모드 시작 (추
 # ── 제어 모드 값 (controlMode) ─────────────────────────────────────────────────
 #   0 = action   : Standby (디폴트) / RL / MPC 이벤트 대기
 #   1 = leg_test : jump / home / moveL / force / gait 이벤트 처리
-CTRL_MODE_ACTION   = 0
+CTRL_MODE_CONNECT   = 0
 CTRL_MODE_LEG_TEST = 1
 
-# ── action 하위 모드 ───────────────────────────────────────────────────────────
-ACTION_STANDBY = 0   # 현재 위치 유지 (디폴트)
-ACTION_RL      = 1   # 외부 low_cmd 추종 (50Hz → 200Hz 보간)
-ACTION_MPC     = 2   # 추후 구현
+# ── connect 하위 모드 ───────────────────────────────────────────────────────────
+CONNECT_STANDBY = 0   # 현재 위치 유지 (디폴트)
+CONNECT_RL      = 1   # 외부 low_cmd 추종 (50Hz → 200Hz 보간)
+CONNECT_MPC     = 2   # 추후 구현
 
 # ── 조인트 매핑: (ROS joint name, ch index) ───────────────────────────────────
 #   ch0 = HL_joint2_thigh_r
@@ -299,7 +299,7 @@ class MotorcortexInterface:
     def reset_gait_event(self):
         self._reset_event(GAIT_EVENT_PATH)
 
-    # ── action 하위 모드 이벤트 구독 / 리셋 ──────────────────────────────────
+    # ── connect 하위 모드 이벤트 구독 / 리셋 ──────────────────────────────────
     def subscribe_standby_event(self, cb: callable):
         self._subscribe_event(STANDBY_EVENT_PATH, 'standby_group', cb)
 
@@ -325,7 +325,7 @@ class MotorcortexInterface:
         def _cb(msg):
             if msg and msg[0].value:
                 raw = int(msg[0].value[0])
-                mode = raw if raw in (CTRL_MODE_ACTION, CTRL_MODE_LEG_TEST) else CTRL_MODE_ACTION
+                mode = raw if raw in (CTRL_MODE_CONNECT, CTRL_MODE_LEG_TEST) else CTRL_MODE_CONNECT
                 on_mode_change(mode)
 
         sub.notify(_cb)
