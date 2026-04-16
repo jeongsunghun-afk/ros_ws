@@ -110,11 +110,11 @@ class JointStateBridge(Node):
                 self._mcx.connect()
                 self.get_logger().info('연결 성공')
 
-                if not self._mcx.engage():
-                    self.get_logger().error('Engage 실패 — 재시도')
-                    time.sleep(5)
-                    continue
-                self.get_logger().info('Engaged')
+                # if not self._mcx.engage():
+                #     self.get_logger().error('Engage 실패 — 재시도')
+                #     time.sleep(5)
+                #     continue
+                # self.get_logger().info('Engaged')
 
                 # self._mcx.set_jog_mode()  # MCX 시작 시 자동 적용 (services_config.json)
                 # self.get_logger().info('JogMode 활성')
