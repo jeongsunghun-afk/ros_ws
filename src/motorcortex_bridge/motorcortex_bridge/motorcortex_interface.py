@@ -30,25 +30,43 @@ ENGAGED_STATE      = 4      # ENGAGED_S
 ENGAGE_TIMEOUT     = 10.0
 
 CONTROL_MODE_PATH   = 'root/UserParameters/controlMode'
-ADDITIVE_CMD_PATH   = 'root/MachineControl/hostInJointAdditivePosition2'  # additive [rad]
+JOG_MODE_PATH       = 'root/MachineControl/gotoJogMode'
+PAUSE_MODE_PATH     = 'root/MachineControl/gotoPauseMode'
 
+# ── 위치제어경로 ──────────────────────────────────────────────────────────
+ADDITIVE_CMD_PATH   = 'root/MachineControl/hostInJointAdditivePosition2'  # additive [rad]
+POS_CMD_PATH       = 'root/MachineControl/hostInJointPosition2'              # 절대 위치 [rad] (배열, 6ch) — ch0~3 = 제어축, ch4~5 = 토우/예비 (0 고정)
+ACTUAL_PATH        = 'root/AxesControl/axesPositionsActual'   # 부모 경로, value[0~4] 인덱싱
+# ── 토크 제어 경로 ────────────────────────────────────────────────────────────
+TORQUE_INPUT_PATH       = 'root/AxesControl/axesTorquesInput'          # 토크 입력 읽기 (배열, Nm)
+TORQUE_CMD_PATH_FMT     = 'root/AxesControl/axesTorquesInput/ch{:d}'   # 채널별 쓰기 (스칼라, Nm) — ch0~5
+TORQUE_ACTUAL_PATH_FMT  = (                                             # 실제 토크 (스칼라, Nm) — {:02d} = 축 번호 (1-based)
+    'root/AxesControl/actuatorControlLoops'
+    '/actuatorControlLoop{:02d}/actuatorTorqueActual'
+)
 # ── 이벤트 경로 (GRID UserParameters) ──────────────────────────────────────────
+# [leg_test 이벤트]
 JUMP_EVENT_PATH    = 'root/UserParameters/jumpmode'     # 점프 궤적 실행
 HOME_EVENT_PATH    = 'root/UserParameters/homemode'     # 홈 복귀
-MOVE_L_EVENT_PATH  = 'root/UserParameters/stopmode'     # moveL (PD 위치 제어)
-FORCE_S_EVENT_PATH = 'root/UserParameters/stopmode'     # forceS (정적 임피던스 I.C.)
-FORCE_T_EVENT_PATH = 'root/UserParameters/stopmode'     # forceT (GRF 궤적 임피던스)
-GAIT_EVENT_PATH    = 'root/UserParameters/stopmode'     # gait (보행 궤적)
+MOVE_L_EVENT_PATH  = 'root/UserParameters/stopmode'     # moveL
+FORCE_S_EVENT_PATH = 'root/UserParameters/stopmode'     # forceS
+FORCE_T_EVENT_PATH = 'root/UserParameters/stopmode'     # forceT
+GAIT_EVENT_PATH    = 'root/UserParameters/stopmode'     # gait
+# [action 하위 모드 이벤트] — 경로는 추후 변경 예정
+STANDBY_EVENT_PATH = 'root/UserParameters/stopmode'     # standby 복귀
+RL_EVENT_PATH      = 'root/UserParameters/stopmode'     # RL 모드 시작
+MPC_EVENT_PATH     = 'root/UserParameters/stopmode'     # MPC 모드 시작 (추후 구현)
 
 # ── 제어 모드 값 (controlMode) ─────────────────────────────────────────────────
-#   0 = standby  : 마지막 위치 유지 (기본)
-#   1 = MPC      : 내부 MPC 제어 (추후 구현)
-#   2 = RL       : 외부 RL 명령 추종 (50Hz → 200Hz 선형 보간)
-#   3 = leg_test : 다리 테스트 모드 (각 이벤트로 동작 트리거)
-CTRL_MODE_STANDBY  = 0
-CTRL_MODE_MPC      = 1
-CTRL_MODE_RL       = 2
-CTRL_MODE_LEG_TEST = 3
+#   0 = action   : Standby (디폴트) / RL / MPC 이벤트 대기
+#   1 = leg_test : jump / home / moveL / force / gait 이벤트 처리
+CTRL_MODE_ACTION   = 0
+CTRL_MODE_LEG_TEST = 1
+
+# ── action 하위 모드 ───────────────────────────────────────────────────────────
+ACTION_STANDBY = 0   # 현재 위치 유지 (디폴트)
+ACTION_RL      = 1   # 외부 low_cmd 추종 (50Hz → 200Hz 보간)
+ACTION_MPC     = 2   # 추후 구현
 
 # ── 조인트 매핑: (ROS joint name, ch index) ───────────────────────────────────
 #   ch0 = HL_joint2_thigh_r
@@ -67,16 +85,6 @@ JOINT_LOOP_MAP = [
     ('HL_joint5_ankle_p', '03'),
     ('HL_joint6_toe_p',   '04'),
 ]
-ACTUAL_PATH        = 'root/AxesControl/axesPositionsActual'   # 부모 경로, value[0~4] 인덱싱
-POS_CMD_PATH       = 'root/MachineControl/hostInJointPosition2'
-
-# ── 토크 제어 경로 ────────────────────────────────────────────────────────────
-TORQUE_INPUT_PATH       = 'root/AxesControl/axesTorquesInput'          # 토크 입력 읽기 (배열, Nm)
-TORQUE_CMD_PATH_FMT     = 'root/AxesControl/axesTorquesInput/ch{:d}'   # 채널별 쓰기 (스칼라, Nm) — ch0~5
-TORQUE_ACTUAL_PATH_FMT  = (                                             # 실제 토크 (스칼라, Nm) — {:02d} = 축 번호 (1-based)
-    'root/AxesControl/actuatorControlLoops'
-    '/actuatorControlLoop{:02d}/actuatorTorqueActual'
-)
 
 class MotorcortexInterface:
     """
@@ -188,6 +196,13 @@ class MotorcortexInterface:
         if blocking:
             future.get()
 
+    def reset_additive(self, blocking: bool = False):
+        """hostInJointAdditivePosition2 에 0 배열 전송 — additive 초기화."""
+        cmd    = [0.0] * NUM_CH
+        future = self._req.setParameter(ADDITIVE_CMD_PATH, cmd)
+        if blocking:
+            future.get()
+
     def get_actual_positions_snapshot(self) -> list:
         """현재 실제 위치 읽기 [rad] — 초기값 설정용 1회성 폴링."""
         try:
@@ -284,6 +299,25 @@ class MotorcortexInterface:
     def reset_gait_event(self):
         self._reset_event(GAIT_EVENT_PATH)
 
+    # ── action 하위 모드 이벤트 구독 / 리셋 ──────────────────────────────────
+    def subscribe_standby_event(self, cb: callable):
+        self._subscribe_event(STANDBY_EVENT_PATH, 'standby_group', cb)
+
+    def reset_standby_event(self):
+        self._reset_event(STANDBY_EVENT_PATH)
+
+    def subscribe_rl_event(self, cb: callable):
+        self._subscribe_event(RL_EVENT_PATH, 'rl_group', cb)
+
+    def reset_rl_event(self):
+        self._reset_event(RL_EVENT_PATH)
+
+    def subscribe_mpc_event(self, cb: callable):
+        self._subscribe_event(MPC_EVENT_PATH, 'mpc_group', cb)
+
+    def reset_mpc_event(self):
+        self._reset_event(MPC_EVENT_PATH)
+
     # ── controlMode 구독 ──────────────────────────────────────────────────────
     def subscribe_control_mode(self, on_mode_change: callable):
         sub = self._sub.subscribe([CONTROL_MODE_PATH], 'ctrl_mode_group', frq_divider=1)
@@ -291,8 +325,41 @@ class MotorcortexInterface:
         def _cb(msg):
             if msg and msg[0].value:
                 raw = int(msg[0].value[0])
-                mode = raw if raw in (CTRL_MODE_MPC, CTRL_MODE_RL, CTRL_MODE_LEG_TEST) else CTRL_MODE_STANDBY
+                mode = raw if raw in (CTRL_MODE_ACTION, CTRL_MODE_LEG_TEST) else CTRL_MODE_ACTION
                 on_mode_change(mode)
+
+        sub.notify(_cb)
+        self._subs.append(sub)
+
+    # ── JogMode / PauseMode 동시 0 구독 ──────────────────────────────────────
+    def subscribe_idle_mode(self, on_idle: callable, on_busy: callable = None):
+        """
+        JogMode/PauseMode 상태 전환 에지 콜백.
+          on_idle : non-idle → idle (둘 다 0) 전환 시 1회 호출
+          on_busy : idle → non-idle (어느 하나라도 non-0) 전환 시 1회 호출
+        """
+        sub = self._sub.subscribe(
+            [JOG_MODE_PATH, PAUSE_MODE_PATH], 'idle_mode_group', frq_divider=1
+        )
+        self._jog_val   = None
+        self._pause_val = None
+        self._was_idle  = False
+
+        def _cb(msg):
+            if not msg or len(msg) < 2:
+                return
+            if msg[0].value:
+                self._jog_val   = int(msg[0].value[0])
+            if msg[1].value:
+                self._pause_val = int(msg[1].value[0])
+            if self._jog_val is None or self._pause_val is None:
+                return
+            is_idle = (self._jog_val == 0 and self._pause_val == 0)
+            if is_idle and not self._was_idle:
+                on_idle()
+            elif not is_idle and self._was_idle and on_busy:
+                on_busy()
+            self._was_idle = is_idle
 
         sub.notify(_cb)
         self._subs.append(sub)
