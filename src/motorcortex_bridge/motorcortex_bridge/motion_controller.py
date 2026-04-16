@@ -526,31 +526,27 @@ class MotionController:
         self._mcx.reset_fall_recovery_event()
 
     def _on_jump(self):
-        self._mcx.reset_jump_event()
+        """jump=1 수신 — 실행 완료 후 event_loop에서 리셋 (콜백에서 blocking reset 금지)."""
         if not self._in_movel:
             self._jump_ev.set()
 
     def _on_home(self):
-        self._mcx.reset_home_event()
+        """home=1 수신 — forceS/forceT finally 블록에서 리셋."""
         self._home_ev.set()
 
     def _on_movel(self):
-        self._mcx.reset_movel_event()
         if not self._in_movel:
             self._movel_ev.set()
 
     def _on_force_s(self):
-        self._mcx.reset_force_s_event()
         if not self._in_movel:
             self._force_s_ev.set()
 
     def _on_force_t(self):
-        self._mcx.reset_force_t_event()
         if not self._in_movel:
             self._force_t_ev.set()
 
     def _on_gait(self):
-        self._mcx.reset_gait_event()
         if not self._in_movel:
             self._gait_ev.set()
 
@@ -596,6 +592,12 @@ class MotionController:
                 self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb=log_cb)
                 if log_cb:
                     log_cb('jump 완료.')
+                # 실행 완료 후 MCX 리셋 — in_movel 게이트로 재트리거 방지
+                # (_send_cst 내부에서 _in_movel=False 되므로 다시 True로 게이트)
+                self._in_movel = True
+                self._mcx.reset_jump_event()   # event_loop 스레드 → blocking 안전
+                self._jump_ev.clear()           # race window 동안 set된 것 정리
+                self._in_movel = False
 
             # ── [Leg_test] Gait ─────────────────────────────────────────────────
             elif self._gait_ev.is_set():
@@ -603,6 +605,10 @@ class MotionController:
                 if log_cb:
                     log_cb('Gait: 보행 궤적 실행 (TODO)')
                 # TODO: GaitController 연동
+                self._in_movel = True
+                self._mcx.reset_gait_event()
+                self._gait_ev.clear()
+                self._in_movel = False
 
             # ── [Leg_test] moveL ────────────────────────────────────────────────
             elif self._movel_ev.is_set():
@@ -618,6 +624,10 @@ class MotionController:
                         f' → ({target[0][0]*1000:.1f},{target[0][1]*1000:.1f},{target[0][2]*1000:.1f})mm'
                     )
                 self.move_l(target, log_cb=log_cb)
+                self._in_movel = True
+                self._mcx.reset_movel_event()
+                self._movel_ev.clear()
+                self._in_movel = False
 
             # ── [Leg_test] ForceT ───────────────────────────────────────────────
             elif self._force_t_ev.is_set():
@@ -697,10 +707,13 @@ class MotionController:
 
         finally:
             self._mcx.set_target_torques([0.0] * N_AXES)
-            self._in_movel   = False
-            self._ctrl_ready = True
+            # _in_movel=True 상태에서 MCX 리셋 — 콜백 재트리거 방지
             self._home_ev.clear()
             self._mcx.reset_home_event()
+            self._mcx.reset_force_s_event()
+            self._force_s_ev.clear()
+            self._in_movel   = False
+            self._ctrl_ready = True
             if log_cb:
                 log_cb('forceS 종료 — 토크 오프셋 초기화')
 
@@ -788,10 +801,13 @@ class MotionController:
 
         finally:
             self._mcx.set_target_torques([0.0] * N_AXES)
-            self._in_movel   = False
-            self._ctrl_ready = True
+            # _in_movel=True 상태에서 MCX 리셋 — 콜백 재트리거 방지
             self._home_ev.clear()
             self._mcx.reset_home_event()
+            self._mcx.reset_force_t_event()
+            self._force_t_ev.clear()
+            self._in_movel   = False
+            self._ctrl_ready = True
             if log_cb:
                 log_cb('forceT 종료 — 토크 오프셋 초기화')
 

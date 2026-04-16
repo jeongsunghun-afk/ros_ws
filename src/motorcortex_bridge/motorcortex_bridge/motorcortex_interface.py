@@ -36,8 +36,7 @@ ADDITIVE_CMD_PATH   = 'root/MachineControl/hostInJointAdditivePosition2'  # addi
 POS_CMD_PATH       = 'root/MachineControl/hostInJointPosition2'              # 절대 위치 [rad] (배열, 6ch) — ch0~3 = 제어축, ch4~5 = 토우/예비 (0 고정)
 ACTUAL_PATH        = 'root/AxesControl/axesPositionsActual'   # 부모 경로, value[0~4] 인덱싱
 # ── 토크 제어 경로 ────────────────────────────────────────────────────────────
-TORQUE_INPUT_PATH       = 'root/AxesControl/axesTorquesInput'          # 토크 입력 읽기 (배열, Nm)
-TORQUE_CMD_PATH_FMT     = 'root/AxesControl/axesTorquesInput/ch{:d}'   # 채널별 쓰기 (스칼라, Nm) — ch0~5
+TORQUE_INPUT_PATH       = 'root/AxesControl/axesTorquesInput'          # 토크 입력 (배열, Nm) — 읽기/쓰기
 TORQUE_ACTUAL_PATH_FMT  = (                                             # 실제 토크 (스칼라, Nm) — {:02d} = 축 번호 (1-based)
     'root/AxesControl/actuatorControlLoops'
     '/actuatorControlLoop{:02d}/actuatorTorqueActual'
@@ -209,16 +208,13 @@ class MotorcortexInterface:
     # ── 토크 명령 ─────────────────────────────────────────────────────────────
     def set_target_torques(self, torques_nm: list, blocking: bool = False):
         """
-        axesTorquesInput/ch{i} 에 채널별 토크 오프셋 전송 (Nm).
+        axesTorquesInput 에 배열로 토크 오프셋 전송 (Nm).
         torques_nm : N_AXES 길이의 토크 리스트 [Nm]
         """
-        futures = []
-        for i, tau in enumerate(torques_nm[:N_AXES]):
-            future = self._req.setParameter(TORQUE_CMD_PATH_FMT.format(i), [float(tau)])
-            futures.append(future)
+        cmd = [float(t) for t in torques_nm[:N_AXES]] + [0.0] * (NUM_CH - N_AXES)
+        future = self._req.setParameter(TORQUE_INPUT_PATH, cmd)
         if blocking:
-            for f in futures:
-                f.get()
+            future.get()
 
     # ── 구독 ─────────────────────────────────────────────────────────────────
     def subscribe_positions(self):
@@ -246,9 +242,16 @@ class MotorcortexInterface:
         sub.notify(_cb)
         self._subs.append(sub)
 
-    def _reset_event(self, path: str):
-        """이벤트 파라미터를 0으로 리셋."""
-        self._req.setParameter(path, [0]).get()
+    def _reset_event(self, path: str, blocking: bool = True):
+        """
+        이벤트 파라미터를 0으로 리셋.
+          blocking=True  (기본값) : .get()으로 MCX 확인 대기 — event_loop/finally 스레드에서만 호출
+          blocking=False          : fire-and-forget — MCX 콜백 스레드에서 호출 시 deadlock 방지용
+                                    ※ 콜백에서 action 이벤트 리셋은 금지 (재트리거 방지 설계)
+        """
+        future = self._req.setParameter(path, [0])
+        if blocking:
+            future.get()
 
     # ── 이벤트 구독 / 리셋 ────────────────────────────────────────────────────────
     def subscribe_jump_event(self, cb: callable):
