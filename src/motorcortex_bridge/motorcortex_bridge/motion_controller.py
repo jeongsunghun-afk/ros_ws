@@ -592,11 +592,13 @@ class MotionController:
                 self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb=log_cb)
                 if log_cb:
                     log_cb('jump 완료.')
-                # 실행 완료 후 MCX 리셋 — in_movel 게이트로 재트리거 방지
-                # (_send_cst 내부에서 _in_movel=False 되므로 다시 True로 게이트)
+                # 완료 후 재트리거 방지:
+                #   _in_movel=True 게이트 유지 → reset 전송(fire-and-forget) →
+                #   50ms sleep으로 MCX 버퍼 콜백 드레인 → clear → 게이트 해제
                 self._in_movel = True
-                self._mcx.reset_jump_event()   # event_loop 스레드 → blocking 안전
-                self._jump_ev.clear()           # race window 동안 set된 것 정리
+                self._mcx.reset_jump_event()
+                time.sleep(0.05)
+                self._jump_ev.clear()
                 self._in_movel = False
 
             # ── [Leg_test] Gait ─────────────────────────────────────────────────
@@ -607,6 +609,7 @@ class MotionController:
                 # TODO: GaitController 연동
                 self._in_movel = True
                 self._mcx.reset_gait_event()
+                time.sleep(0.05)
                 self._gait_ev.clear()
                 self._in_movel = False
 
@@ -626,6 +629,7 @@ class MotionController:
                 self.move_l(target, log_cb=log_cb)
                 self._in_movel = True
                 self._mcx.reset_movel_event()
+                time.sleep(0.05)
                 self._movel_ev.clear()
                 self._in_movel = False
 
@@ -707,11 +711,13 @@ class MotionController:
 
         finally:
             self._mcx.set_target_torques([0.0] * N_AXES)
-            # _in_movel=True 상태에서 MCX 리셋 — 콜백 재트리거 방지
+            # _in_movel=True 상태에서 MCX 리셋 후 버퍼 드레인
             self._home_ev.clear()
             self._mcx.reset_home_event()
             self._mcx.reset_force_s_event()
+            time.sleep(0.05)
             self._force_s_ev.clear()
+            self._home_ev.clear()
             self._in_movel   = False
             self._ctrl_ready = True
             if log_cb:
@@ -801,11 +807,13 @@ class MotionController:
 
         finally:
             self._mcx.set_target_torques([0.0] * N_AXES)
-            # _in_movel=True 상태에서 MCX 리셋 — 콜백 재트리거 방지
+            # _in_movel=True 상태에서 MCX 리셋 후 버퍼 드레인
             self._home_ev.clear()
             self._mcx.reset_home_event()
             self._mcx.reset_force_t_event()
+            time.sleep(0.05)
             self._force_t_ev.clear()
+            self._home_ev.clear()
             self._in_movel   = False
             self._ctrl_ready = True
             if log_cb:

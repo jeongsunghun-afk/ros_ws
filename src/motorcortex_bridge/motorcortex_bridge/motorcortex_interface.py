@@ -242,16 +242,13 @@ class MotorcortexInterface:
         sub.notify(_cb)
         self._subs.append(sub)
 
-    def _reset_event(self, path: str, blocking: bool = True):
+    def _reset_event(self, path: str):
         """
-        이벤트 파라미터를 0으로 리셋.
-          blocking=True  (기본값) : .get()으로 MCX 확인 대기 — event_loop/finally 스레드에서만 호출
-          blocking=False          : fire-and-forget — MCX 콜백 스레드에서 호출 시 deadlock 방지용
-                                    ※ 콜백에서 action 이벤트 리셋은 금지 (재트리거 방지 설계)
+        이벤트 파라미터를 0으로 리셋 (fire-and-forget).
+        호출 후 caller가 time.sleep(0.05)로 MCX 버퍼 콜백을 드레인해야 함.
+        ※ 콜백 스레드에서 action 이벤트 리셋 금지 (재트리거 방지 설계)
         """
-        future = self._req.setParameter(path, [0])
-        if blocking:
-            future.get()
+        self._req.setParameter(path, [0])
 
     # ── 이벤트 구독 / 리셋 ────────────────────────────────────────────────────────
     def subscribe_jump_event(self, cb: callable):
