@@ -117,6 +117,8 @@ class MotorcortexInterface:
             except Exception:
                 pass
         self._subs.clear()
+        self._req = None
+        self._sub = None
 
     @property
     def is_connected(self) -> bool:

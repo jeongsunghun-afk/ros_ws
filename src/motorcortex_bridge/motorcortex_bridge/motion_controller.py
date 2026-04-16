@@ -424,10 +424,6 @@ class MotionController:
         with self._lock:
             return list(self._last_cmd_pos)
 
-    @property
-    def ctrl_mode(self) -> int:
-        return self._ctrl_mode
-
     # ── moveL 목표 좌표 설정 ──────────────────────────────────────────────────
     def set_movel_target(self, target):
         """
@@ -530,25 +526,31 @@ class MotionController:
         self._mcx.reset_fall_recovery_event()
 
     def _on_jump(self):
+        self._mcx.reset_jump_event()
         if not self._in_movel:
             self._jump_ev.set()
 
     def _on_home(self):
+        self._mcx.reset_home_event()
         self._home_ev.set()
 
     def _on_movel(self):
+        self._mcx.reset_movel_event()
         if not self._in_movel:
             self._movel_ev.set()
 
     def _on_force_s(self):
+        self._mcx.reset_force_s_event()
         if not self._in_movel:
             self._force_s_ev.set()
 
     def _on_force_t(self):
+        self._mcx.reset_force_t_event()
         if not self._in_movel:
             self._force_t_ev.set()
 
     def _on_gait(self):
+        self._mcx.reset_gait_event()
         if not self._in_movel:
             self._gait_ev.set()
 
@@ -586,20 +588,18 @@ class MotionController:
                 # TODO: fall recovery 궤적 실행
 
             # ── [Leg_test] Jump ─────────────────────────────────────────────────
-            elif self._jump_ev.wait(timeout=0.01):
+            elif self._jump_ev.is_set():
                 self._in_movel = True
                 self._jump_ev.clear()
-                self._mcx.reset_jump_event()
                 if log_cb:
                     log_cb('Jump: 점프 궤적 실행')
-                self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb)
+                self._send_cst(self._waypoints, self.traj_dt, 'jump', log_cb=log_cb)
                 if log_cb:
                     log_cb('jump 완료.')
 
             # ── [Leg_test] Gait ─────────────────────────────────────────────────
             elif self._gait_ev.is_set():
                 self._gait_ev.clear()
-                self._mcx.reset_gait_event()
                 if log_cb:
                     log_cb('Gait: 보행 궤적 실행 (TODO)')
                 # TODO: GaitController 연동
@@ -607,7 +607,6 @@ class MotionController:
             # ── [Leg_test] moveL ────────────────────────────────────────────────
             elif self._movel_ev.is_set():
                 self._movel_ev.clear()
-                self._mcx.reset_movel_event()
                 actual_j = self._mcx.actual_positions
                 fk_pts   = forward_kinematics(actual_j)
                 p_cur    = fk_pts[-1].tolist()
@@ -623,7 +622,6 @@ class MotionController:
             # ── [Leg_test] ForceT ───────────────────────────────────────────────
             elif self._force_t_ev.is_set():
                 self._force_t_ev.clear()
-                self._mcx.reset_force_t_event()
                 if log_cb:
                     log_cb('ForceT: GRF 궤적 임피던스 제어 시작')
                 self._run_force_t(log_cb=log_cb)
@@ -633,7 +631,6 @@ class MotionController:
             # ── [Leg_test] ForceS ───────────────────────────────────────────────
             elif self._force_s_ev.is_set():
                 self._force_s_ev.clear()
-                self._mcx.reset_force_s_event()
                 if log_cb:
                     log_cb('ForceS: 정적 임피던스 제어 시작')
                 self._run_force_s(log_cb=log_cb)
@@ -702,6 +699,8 @@ class MotionController:
             self._mcx.set_target_torques([0.0] * N_AXES)
             self._in_movel   = False
             self._ctrl_ready = True
+            self._home_ev.clear()
+            self._mcx.reset_home_event()
             if log_cb:
                 log_cb('forceS 종료 — 토크 오프셋 초기화')
 
@@ -791,6 +790,8 @@ class MotionController:
             self._mcx.set_target_torques([0.0] * N_AXES)
             self._in_movel   = False
             self._ctrl_ready = True
+            self._home_ev.clear()
+            self._mcx.reset_home_event()
             if log_cb:
                 log_cb('forceT 종료 — 토크 오프셋 초기화')
 
@@ -1056,9 +1057,6 @@ class MotionController:
                 continue
 
             with self._lock:
-                mode     = self._ctrl_mode
-                sub_mode = self._connect_sub_mode
-
                 if self._rl_trot_active:
                     # RL_trot: 외부 low_cmd 추종 — prev → target 선형 보간 (50Hz → 200Hz)
                     elapsed = time.monotonic() - self._interp_time
