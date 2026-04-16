@@ -29,10 +29,8 @@ ENGAGE_CMD         = 2      # GOTO_ENGAGED_E
 ENGAGED_STATE      = 4      # ENGAGED_S
 ENGAGE_TIMEOUT     = 10.0
 
-CONTROL_MODE_PATH   = 'root/UserParameters/controlMode'
 JOG_MODE_PATH       = 'root/MachineControl/gotoJogMode'
 PAUSE_MODE_PATH     = 'root/MachineControl/gotoPauseMode'
-
 # ── 위치제어경로 ──────────────────────────────────────────────────────────
 ADDITIVE_CMD_PATH   = 'root/MachineControl/hostInJointAdditivePosition2'  # additive [rad]
 POS_CMD_PATH       = 'root/MachineControl/hostInJointPosition2'              # 절대 위치 [rad] (배열, 6ch) — ch0~3 = 제어축, ch4~5 = 토우/예비 (0 고정)
@@ -46,16 +44,18 @@ TORQUE_ACTUAL_PATH_FMT  = (                                             # 실제
 )
 # ── 이벤트 경로 (GRID UserParameters) ──────────────────────────────────────────
 # [leg_test 이벤트]
-JUMP_EVENT_PATH    = 'root/UserParameters/jumpmode'     # 점프 궤적 실행
-HOME_EVENT_PATH    = 'root/UserParameters/homemode'     # 홈 복귀
-MOVE_L_EVENT_PATH  = 'root/UserParameters/stopmode'     # moveL
-FORCE_S_EVENT_PATH = 'root/UserParameters/stopmode'     # forceS
-FORCE_T_EVENT_PATH = 'root/UserParameters/stopmode'     # forceT
-GAIT_EVENT_PATH    = 'root/UserParameters/stopmode'     # gait
+CONTROL_MODE_PATH   = 'root/UserParameters/controlMode'
+JUMP_EVENT_PATH    = 'root/UserParameters/jump'     # 점프 궤적 실행
+HOME_EVENT_PATH    = 'root/UserParameters/home'     # 홈 복귀
+MOVE_L_EVENT_PATH  = 'root/UserParameters/moveL'     # moveL
+FORCE_S_EVENT_PATH = 'root/UserParameters/forceS'     # forceS
+FORCE_T_EVENT_PATH = 'root/UserParameters/forceT'     # forceT
+GAIT_EVENT_PATH    = 'root/UserParameters/gait'     # gait
 # [connect 하위 모드 이벤트] — 경로는 추후 변경 예정
-STANDBY_EVENT_PATH = 'root/UserParameters/stopmode'     # standby 복귀
-RL_EVENT_PATH      = 'root/UserParameters/stopmode'     # RL 모드 시작
-MPC_EVENT_PATH     = 'root/UserParameters/stopmode'     # MPC 모드 시작 (추후 구현)
+CONNECT_MODE_PATH   = 'root/UserParameters/connectMode'
+STANDBY_EVENT_PATH = 'root/UserParameters/standby'     # standby 복귀
+RL_EVENT_PATH      = 'root/UserParameters/RL'     # RL 모드 시작
+MPC_EVENT_PATH     = 'root/UserParameters/MPC'     # MPC 모드 시작 (추후 구현)
 
 # ── 제어 모드 값 (controlMode) ─────────────────────────────────────────────────
 #   0 = action   : Standby (디폴트) / RL / MPC 이벤트 대기
