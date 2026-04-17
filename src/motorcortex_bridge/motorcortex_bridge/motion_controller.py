@@ -32,6 +32,7 @@ RL_trot 보간:
   t = elapsed / CMD_PERIOD   (CMD_PERIOD = 1/50Hz = 0.02s)
 """
 
+import itertools
 import threading
 import time
 import math
@@ -437,7 +438,8 @@ class MotionController:
         self._jump_ev          = threading.Event()   # 점프 궤적
         self._home_ev          = threading.Event()   # 홈 복귀
         self._movel_ev         = threading.Event()   # moveL
-        self._force_t_ev       = threading.Event()   # forceT
+        self._force_t_active   = False               # forceT 제어 활성 플래그 (value=1 시작, 0 종료)
+        self._force_t_start_ev = threading.Event()   # forceT=1 수신 → event_loop 기동 신호
         self._force_s_active   = False               # moveL 임피던스 모드 토글 (forceS 버튼)
         self._gait_ev          = threading.Event()   # Gait
 
@@ -515,7 +517,7 @@ class MotionController:
         self._mcx.subscribe_home_event(self._on_home)
         self._mcx.subscribe_movel_event(self._on_movel)
         self._mcx.subscribe_force_s_event(self._on_force_s)
-        self._mcx.subscribe_force_t_event(self._on_force_t)
+        self._mcx.subscribe_force_t_event(self._on_force_t_start, self._on_force_t_stop)
         self._mcx.subscribe_gait_event(self._on_gait)
 
         self._event_thread = threading.Thread(
@@ -578,9 +580,15 @@ class MotionController:
         self._force_s_active = not self._force_s_active
         self._mcx.reset_force_s_event()
 
-    def _on_force_t(self):
+    def _on_force_t_start(self):
+        """forceT=1 수신 — GRF 제어 시작."""
         if not self._in_movel:
-            self._force_t_ev.set()
+            self._force_t_active = True
+            self._force_t_start_ev.set()
+
+    def _on_force_t_stop(self):
+        """forceT=0 수신 — GRF 제어 종료."""
+        self._force_t_active = False
 
     def _on_gait(self):
         if not self._in_movel:
@@ -667,14 +675,12 @@ class MotionController:
 
                 if log_cb:
                     log_cb(
-                        f'moveL step (φ={math.degrees(phi):.1f}°'
-                        f', force={"ON" if self._force_s_active else "OFF"}): '
+                        f'moveL step (φ={math.degrees(phi):.1f}°): '
                         f'start=({p_start[0]*1e3:.1f},{p_start[2]*1e3:.1f})mm(x,z)'
                         f' → peak=({p_peak[0]*1e3:.1f},{p_peak[2]*1e3:.1f})mm'
                         f' → end=({p_end[0]*1e3:.1f},{p_end[2]*1e3:.1f})mm'
                     )
-                self.move_l([p_start, p_peak, p_end], phi=phi,
-                            with_force=self._force_s_active, log_cb=log_cb)
+                self.move_l([p_start, p_peak, p_end], phi=phi, log_cb=log_cb)
                 self._in_movel = True
                 self._mcx.reset_movel_event()
                 time.sleep(0.05)
@@ -682,8 +688,8 @@ class MotionController:
                 self._in_movel = False
 
             # ── [Leg_test] ForceT ───────────────────────────────────────────────
-            elif self._force_t_ev.is_set():
-                self._force_t_ev.clear()
+            elif self._force_t_start_ev.is_set():
+                self._force_t_start_ev.clear()
                 if log_cb:
                     log_cb('ForceT: 발끝 고정 + 실측 토크 → GRF 추정 시작')
                 self._run_force_t(log_cb=log_cb)
@@ -694,18 +700,19 @@ class MotionController:
                 time.sleep(0.01)
 
 
-    # ── forceT: 발끝 고정 + 실측 토크 → GRF 추정 임피던스 제어 루프 ─────────
+    # ── forceT: 발끝 고정 + GRF 추정 — _send_cst 경유 ──────────────────────
     def _run_force_t(self, log_cb=None):
         """
-        발끝 고정 위치 유지 + 실측 토크 → GRF 추정 임피던스 제어 루프 (blocking).
-        목표: 현재 발끝 위치에서 X축 +10mm 지점을 q_r로 유지하며
-              실측 토크로 GRF를 추정하고 τ_off = τ_g − τ_grf + τ_imp 를 전송.
+        발끝 고정 위치 유지 + GRF 추정 임피던스 제어 루프 (blocking).
+        _send_cst를 통해 위치+토크를 단일 경로로 전송.
 
-        종료 조건: HomeEvent 또는 JumpEvent 발생
+        forceS(_force_s_active) 플래그를 실시간으로 체크하므로
+        forceT 실행 중에도 forceS ON/OFF 가능.
+        종료: forceT=0(_force_t_active=False) / HomeEvent / JumpEvent
         """
         q_a_phy = _to_phy(self._mcx.actual_positions)
         x_a     = np.array(forward_kinematics(q_a_phy)[-1])
-        x_r     = x_a + np.array([0.01, 0.0, 0.0])    # X +10mm
+        x_r     = x_a + np.array([0.01, 0.0, 0.0])   # X +10mm 고정 목표
         phi     = q_a_phy[1] + q_a_phy[2] + q_a_phy[3]
 
         q_r_phy = analytical_ik(x_r[0], x_r[1], x_r[2], phi)
@@ -721,65 +728,47 @@ class MotionController:
                 f' {x_r[2]*1000:.1f}) mm'
             )
 
-        self._in_movel   = True
-        self._ctrl_ready = False
-        dt = self.traj_dt   # 200 Hz
+        # _send_cst 호출: 무한 반복 waypoint + stop_fn으로 종료 제어
+        self._send_cst(
+            itertools.repeat(q_r_mcx),
+            self.traj_dt,
+            'forceT',
+            cartesian_refs=itertools.repeat(x_r),
+            stop_fn=lambda: (not self._force_t_active
+                             or self._home_ev.is_set()
+                             or self._jump_ev.is_set()),
+            log_cb=log_cb,
+        )
 
-        try:
-            x_a_prev, _, _ = _compute_kinematics(q_a_phy)
-
-            t0 = time.monotonic()
-            k  = 0
-            while not (self._home_ev.is_set() or self._jump_ev.is_set()):
-                q_now_phy     = _to_phy(self._mcx.actual_positions)
-                x_a, J, tau_g = _compute_kinematics(q_now_phy)
-
-                dx_a     = (x_a - x_a_prev) / dt
-                x_a_prev = x_a.copy()
-
-                # 실측 토크 → GRF 추정
-                tau_actual = self._mcx.actual_torque
-                grf_est    = compute_grf(tau_actual, tau_g, J)
-                tau_grf    = J.T @ grf_est
-
-                tau_imp = compute_impedance_torque(x_r, x_a, J, dx_a=dx_a)
-                tau_off = (tau_g - tau_grf + tau_imp).tolist()
-
-                self._mcx.set_target_positions(q_r_mcx)
-                self._mcx.set_target_torques(tau_off)
-                with self._lock:
-                    self._last_cmd_pos = list(q_r_mcx)
-
-                k += 1
-                sleep_t = t0 + k * dt - time.monotonic()
-                if sleep_t > 0:
-                    time.sleep(sleep_t)
-
-        finally:
-            self._mcx.set_target_torques([0.0] * N_AXES)
-            # _in_movel=True 게이트 유지 → reset → 50ms 드레인 → clear → 해제
-            self._mcx.reset_home_event()
-            self._mcx.reset_force_t_event()
-            time.sleep(0.05)
-            self._force_t_ev.clear()
-            self._home_ev.clear()
-            self._in_movel   = False
-            self._ctrl_ready = True
-            if log_cb:
-                log_cb('forceT 종료 — 토크 오프셋 초기화')
+        # ── 종료 후 드레인 (home/jump 이벤트 콜백 재진입 방지) ───────────────
+        self._force_t_active = False
+        self._in_movel = True          # 드레인 기간 게이트 유지
+        self._mcx.reset_home_event()
+        self._mcx.reset_force_t_event()
+        time.sleep(0.05)
+        self._force_t_start_ev.clear()
+        self._home_ev.clear()
+        self._in_movel = False
+        if log_cb:
+            log_cb('forceT 종료 — 토크 오프셋 초기화')
 
     # ── 궤적 실행 공통 내부 함수 ──────────────────────────────────────────────
     def load_trajectory(self) -> list:
         return load_trajectory(self.traj_file)
 
-    def _send_cst(self, waypoints: list, dt: float, label: str,
-                  torques: list = None, log_cb=None):
+    def _send_cst(self, waypoints, dt: float, label: str,
+                  cartesian_refs=None, stop_fn=None, log_cb=None):
         """
-        joint 공간 waypoints를 MCX에 전송 (blocking).
-        waypoints : list of list[float]  [rad]          — q_r
-        torques   : list of list[float]  [Nm] or None   — τ_offset (τ_ff + τ_imp)
-                    None이면 토크 오프셋 0으로 전송
-        dt        : waypoint 간격 [s]
+        joint 공간 waypoints를 MCX에 전송하는 단일 출력 경로 (blocking).
+
+        waypoints      : iterable of list[float] [rad]        — q_r (MCX offset)
+        cartesian_refs : iterable of array-like [m] or None
+                         각 step의 발끝 목표 좌표 (힙 원점 기준).
+                         제공 시 매 step마다 FK/Jacobian/중력토크 계산.
+                         _force_s_active=True 이면 GRF+임피던스 토크 추가 적용.
+                         _force_s_active=False 이면 zero torque 전송.
+        stop_fn        : callable() → True 이면 루프 즉시 종료 (forceT 종료조건 등)
+        dt             : waypoint 간격 [s]
         """
         self._ctrl_ready = False
         self._in_movel   = True
@@ -791,36 +780,71 @@ class MotionController:
             pass
 
         zero_torque = [0.0] * N_AXES
+
+        # 발끝 속도 추정용 초기값 (forceS 실시간 전환 시 연속성 보장)
+        x_a_prev, _, _ = _compute_kinematics(_to_phy(self._mcx.actual_positions))
+
         if log_cb:
-            log_cb(f'{label} 시작: {len(waypoints)} waypoints / dt={dt*1000:.1f}ms')
+            log_cb(f'{label} 시작 / dt={dt*1000:.1f}ms'
+                   + (' / force_ref=O' if cartesian_refs is not None else ''))
 
         t0 = time.monotonic()
-        for idx, wp in enumerate(waypoints):
-            tau = torques[idx] if (torques and idx < len(torques)) else zero_torque
-            self._mcx.set_target_positions(list(wp))
-            self._mcx.set_target_torques(tau)
+
+        step_iter = (zip(waypoints, cartesian_refs)
+                     if cartesian_refs is not None
+                     else ((wp, None) for wp in waypoints))
+
+        try:
+            for idx, (wp, x_r_cart) in enumerate(step_iter):
+                if stop_fn and stop_fn():
+                    break
+
+                wp = list(wp)
+
+                if x_r_cart is not None:
+                    # cartesian_refs 있음 → FK/J/τ_g 항상 계산 (forceS 전환 대비)
+                    q_now_phy     = _to_phy(self._mcx.actual_positions)
+                    x_a, J, tau_g = _compute_kinematics(q_now_phy)
+                    dx_a          = (x_a - x_a_prev) / dt
+                    x_a_prev      = x_a.copy()
+
+                    if self._force_s_active:
+                        # τ_off = τ_g − τ_grf + τ_imp
+                        tau_actual = self._mcx.actual_torque
+                        grf_est    = compute_grf(tau_actual, tau_g, J)
+                        tau_imp    = compute_impedance_torque(
+                                         np.asarray(x_r_cart), x_a, J, dx_a=dx_a)
+                        tau = (tau_g - J.T @ grf_est + tau_imp).tolist()
+                    else:
+                        tau = zero_torque
+                else:
+                    tau = zero_torque
+
+                self._mcx.set_target_positions(wp)
+                self._mcx.set_target_torques(tau)
+                with self._lock:
+                    self._last_cmd_pos = wp
+
+                if log_cb and idx % max(1, int(1.0 / dt)) == 0:
+                    log_cb(
+                        f'{label} [{idx}] '
+                        + '  '.join(f'th{i+1}={math.degrees(wp[i]):+.2f}°'
+                                    for i in range(N_AXES))
+                    )
+
+                sleep_t = t0 + (idx + 1) * dt - time.monotonic()
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+        finally:
+            self._mcx.set_target_torques(zero_torque)
+            self._in_movel = False
             with self._lock:
-                self._last_cmd_pos = list(wp)
-
-            if log_cb and idx % max(1, int(1.0 / dt)) == 0:
-                log_cb(
-                    f'{label} [{idx}/{len(waypoints)}] '
-                    + '  '.join(f'th{i+1}={math.degrees(wp[i]):+.2f}°'
-                                for i in range(N_AXES))
-                )
-
-            sleep_t = t0 + (idx + 1) * dt - time.monotonic()
-            if sleep_t > 0:
-                time.sleep(sleep_t)
-
-        self._mcx.set_target_torques(zero_torque)   # 완료 후 토크 오프셋 초기화
-        self._in_movel = False
-        with self._lock:
-            self._interp_prev   = list(self._last_cmd_pos)
-            self._interp_target = list(self._last_cmd_pos)
-        self._ctrl_ready = True
-        if log_cb:
-            log_cb(f'{label} 완료 — interp loop 재개.')
+                self._interp_prev   = list(self._last_cmd_pos)
+                self._interp_target = list(self._last_cmd_pos)
+            self._ctrl_ready = True
+            if log_cb:
+                log_cb(f'{label} 완료 — interp loop 재개.')
 
     # ── moveJ ─────────────────────────────────────────────────────────────────
     def move_j(self, joint_waypoints: list, dt: float = None,
@@ -865,16 +889,15 @@ class MotionController:
 
     # ── moveL ─────────────────────────────────────────────────────────────────
     def move_l(self, cartesian_waypoints: list, phi: float = None,
-               dt: float = None, with_force: bool = False, log_cb=None):
+               dt: float = None, log_cb=None):
         """
         Cartesian 공간 moveL (Bezier 곡선 보간).
+        forceS 임피던스 적용 여부는 _force_s_active 플래그로 실시간 제어 (_send_cst 내부).
 
         cartesian_waypoints : list of (Px, Py, Pz) [m] — Bezier 제어점 (현재 위치 제외)
                               현재 발끝 위치가 P0로 자동 추가되어 (n+1)차 Bezier 생성.
-        phi       : θ2+θ3+θ4 유지 각도 [rad]. None이면 현재 관절값에서 자동 계산.
-        with_force: True이면 각 Bezier 점에서 실시간 임피던스 + GRF 토크 적용 (forceS 모드).
-                    False이면 순수 위치 제어 (_send_cst).
-        dt        : 전송 주기 [s] (기본 200Hz)
+        phi    : θ2+θ3+θ4 유지 각도 [rad]. None이면 현재 관절값에서 자동 계산.
+        dt     : 전송 주기 [s] (기본 200Hz)
         """
         dt = dt if dt is not None else self.traj_dt
 
@@ -885,16 +908,13 @@ class MotionController:
         if phi is None:
             phi = current_j_phy[1] + current_j_phy[2] + current_j_phy[3]
 
-        # Bezier 제어점: 현재 발끝 위치(P0) + 외부 제어점
-        p_cur     = forward_kinematics(current_j_phy)[-1]
-        ctrl_pts  = [p_cur] + [np.asarray(wp, dtype=float) for wp in cartesian_waypoints]
+        p_cur    = forward_kinematics(current_j_phy)[-1]
+        ctrl_pts = [p_cur] + [np.asarray(wp, dtype=float) for wp in cartesian_waypoints]
 
-        # 제어점 간 코드 길이로 샘플 수 결정
         chord = sum(np.linalg.norm(ctrl_pts[i + 1] - ctrl_pts[i])
                     for i in range(len(ctrl_pts) - 1))
         n = max(10, int(chord / (MOVEL_VEL * dt)))
 
-        # Bezier 곡선 이산화 → IK → MCX offset
         bezier_pts = _bezier_curve(ctrl_pts, n)
         dense_j    = []
         prev_phy   = current_j_phy
@@ -908,56 +928,10 @@ class MotionController:
             dense_j.append(_to_mcx(result_phy))
 
         if log_cb:
-            log_cb(
-                f'moveL{"(force)" if with_force else ""}: '
-                f'{n}pts / chord={chord*1e3:.1f}mm / dt={dt*1e3:.1f}ms'
-            )
+            log_cb(f'moveL: {n}pts / chord={chord*1e3:.1f}mm / dt={dt*1e3:.1f}ms')
 
-        if not with_force:
-            # ── 순수 위치 제어 ──────────────────────────────────────────────
-            self._send_cst(dense_j, dt, 'moveL', log_cb=log_cb)
-
-        else:
-            # ── 실시간 임피던스 + GRF 제어 (forceS 모드) ───────────────────
-            self._ctrl_ready = False
-            self._in_movel   = True
-            x_a_prev = p_cur.copy()
-            t0 = time.monotonic()
-            try:
-                for idx, (q_r_mcx, x_r_cart) in enumerate(zip(dense_j, bezier_pts)):
-                    if self._home_ev.is_set() or self._jump_ev.is_set():
-                        if log_cb:
-                            log_cb('moveL(force): HomeEvent/JumpEvent — 조기 종료')
-                        break
-
-                    q_now_phy     = _to_phy(self._mcx.actual_positions)
-                    x_a, J, tau_g = _compute_kinematics(q_now_phy)
-
-                    dx_a     = (x_a - x_a_prev) / dt
-                    x_a_prev = x_a.copy()
-
-                    tau_actual = self._mcx.actual_torque
-                    grf_est    = compute_grf(tau_actual, tau_g, J)
-                    tau_grf    = J.T @ grf_est
-                    tau_imp    = compute_impedance_torque(x_r_cart, x_a, J, dx_a=dx_a)
-                    tau_off    = (tau_g - tau_grf + tau_imp).tolist()
-
-                    self._mcx.set_target_positions(list(q_r_mcx))
-                    self._mcx.set_target_torques(tau_off)
-                    with self._lock:
-                        self._last_cmd_pos = list(q_r_mcx)
-
-                    sleep_t = t0 + (idx + 1) * dt - time.monotonic()
-                    if sleep_t > 0:
-                        time.sleep(sleep_t)
-
-            finally:
-                self._mcx.set_target_torques([0.0] * N_AXES)
-                self._in_movel = False
-                with self._lock:
-                    self._interp_prev   = list(self._last_cmd_pos)
-                    self._interp_target = list(self._last_cmd_pos)
-                self._ctrl_ready = True
+        # bezier_pts를 cartesian_refs로 전달 — _send_cst가 forceS 실시간 체크
+        self._send_cst(dense_j, dt, 'moveL', cartesian_refs=bezier_pts, log_cb=log_cb)
 
     # ── 홈 복귀 궤적 ─────────────────────────────────────────────────────────────
     def move_to_home(self, max_vel: float = HOME_MAX_VEL,

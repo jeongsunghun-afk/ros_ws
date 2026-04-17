@@ -242,6 +242,27 @@ class MotorcortexInterface:
         sub.notify(_cb)
         self._subs.append(sub)
 
+    def _subscribe_level_event(self, path: str, group: str,
+                               on_high: callable, on_low: callable = None):
+        """value=1 → on_high, value=0 → on_low. 에지 감지: 이전과 동일 시 무시."""
+        sub = self._sub.subscribe([path], group, frq_divider=1)
+        _prev = [None]
+
+        def _cb(msg):
+            if not msg or not msg[0].value:
+                return
+            val = int(msg[0].value[0])
+            if val == _prev[0]:
+                return
+            _prev[0] = val
+            if val == 1:
+                on_high()
+            elif val == 0 and on_low:
+                on_low()
+
+        sub.notify(_cb)
+        self._subs.append(sub)
+
     def _reset_event(self, path: str):
         """
         이벤트 파라미터를 0으로 리셋 (fire-and-forget).
@@ -275,8 +296,9 @@ class MotorcortexInterface:
     def reset_force_s_event(self):
         self._reset_event(FORCE_S_EVENT_PATH)
 
-    def subscribe_force_t_event(self, cb: callable):
-        self._subscribe_event(FORCE_T_EVENT_PATH, 'forcet_group', cb)
+    def subscribe_force_t_event(self, on_start: callable, on_stop: callable = None):
+        """forceT 레벨 구독: value=1 → on_start, value=0 → on_stop."""
+        self._subscribe_level_event(FORCE_T_EVENT_PATH, 'forcet_group', on_start, on_stop)
 
     def reset_force_t_event(self):
         self._reset_event(FORCE_T_EVENT_PATH)
