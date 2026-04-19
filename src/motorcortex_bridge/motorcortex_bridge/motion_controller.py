@@ -21,8 +21,8 @@ ROS2 의존성 없음 — joint_state_bridge 에서 생성하여 사용
   RL_trot       — RL 명령 추종 (50Hz → 200Hz 선형 보간)
   Fall recovery — 낙상 복구
   jump          — 점프 궤적 실행 (.txt)
-  gait          — 보행 궤적 (추후 구현)
-  moveL         — Cartesian 직선 이동
+  gait          — Bezier 발걸음 패턴 (이전 moveL 구현)
+  moveL         — Cartesian quintic polynomial 직선 이동
   forceT        — 발끝 고정 + 실측 토크 → GRF 추정 임피던스 제어
   forceS        — moveL 임피던스 모드 토글 (ON시 moveL에 GRF+임피던스 토크 추가)
 
@@ -648,10 +648,10 @@ class MotionController:
             # ── [Leg_test] Gait ─────────────────────────────────────────────────
             elif self._gait_ev.is_set():
                 self._gait_ev.clear()
-                if log_cb:
-                    log_cb('Gait: 보행 궤적 실행 (TODO)')
-                # TODO: GaitController 연동
                 self._in_movel = True
+                if log_cb:
+                    log_cb('Gait: Bezier 발걸음 패턴 실행')
+                self._run_gait(log_cb=log_cb)
                 self._mcx.reset_gait_event()
                 time.sleep(0.05)
                 self._gait_ev.clear()
@@ -667,20 +667,18 @@ class MotionController:
                 phi          = actual_j_phy[1] + actual_j_phy[2] + actual_j_phy[3]
                 with self._lock:
                     self._last_cmd_pos = list(actual_j_mcx)
+                    x_target = self._movel_target[0] if self._movel_target else None
 
-                # Bezier 제어점: 발끝 +20mm(x) → 최고점(z+30mm) → -20mm(x)
-                p_start = (p_cur[0] + MOVEL_STEP_X, p_cur[1], p_cur[2]              )
-                p_peak  = (p_cur[0],                 p_cur[1], p_cur[2] + MOVEL_STEP_H)
-                p_end   = (p_cur[0] - MOVEL_STEP_X, p_cur[1], p_cur[2]              )
+                if x_target is None:
+                    x_target = (p_cur[0] + MOVEL_STEP_X, p_cur[1], p_cur[2])
 
                 if log_cb:
                     log_cb(
-                        f'moveL step (φ={math.degrees(phi):.1f}°): '
-                        f'start=({p_start[0]*1e3:.1f},{p_start[2]*1e3:.1f})mm(x,z)'
-                        f' → peak=({p_peak[0]*1e3:.1f},{p_peak[2]*1e3:.1f})mm'
-                        f' → end=({p_end[0]*1e3:.1f},{p_end[2]*1e3:.1f})mm'
+                        f'moveL(quintic, φ={math.degrees(phi):.1f}°): '
+                        f'target=({x_target[0]*1e3:.1f},'
+                        f'{x_target[1]*1e3:.1f},{x_target[2]*1e3:.1f})mm'
                     )
-                self.move_l([p_start, p_peak, p_end], phi=phi, log_cb=log_cb)
+                self.move_l(x_target, phi=phi, log_cb=log_cb)
                 self._in_movel = True
                 self._mcx.reset_movel_event()
                 time.sleep(0.05)
@@ -751,6 +749,55 @@ class MotionController:
         self._in_movel = False
         if log_cb:
             log_cb('forceT 종료 — 토크 오프셋 초기화')
+
+    # ── IK 루프 공통 헬퍼 ────────────────────────────────────────────────────
+    def _ik_trajectory(self, cart_pts, phi: float, prev_phy: list,
+                       log_cb=None, label: str = 'IK') -> list:
+        """cart_pts(Cartesian 위치 목록) → MCX offset 관절각 목록. IK 실패 시 이전 해 유지."""
+        dense_j = []
+        for pt in cart_pts:
+            r = analytical_ik(float(pt[0]), float(pt[1]), float(pt[2]), phi)
+            if r is None:
+                if log_cb:
+                    log_cb(f'{label} IK 실패: ({pt[0]*1e3:.1f},{pt[1]*1e3:.1f},{pt[2]*1e3:.1f})mm')
+                r = prev_phy
+            prev_phy = r
+            dense_j.append(_to_mcx(r))
+        return dense_j
+
+    # ── gait: Bezier 발걸음 패턴 ─────────────────────────────────────────────
+    def _run_gait(self, log_cb=None):
+        """
+        Bezier 발걸음 패턴 (blocking): p_cur → +x → +z(peak) → −x.
+        forceS(_force_s_active) 플래그를 실시간 체크 — gait 실행 중 forceS ON/OFF 가능.
+        """
+        actual_j_mcx = self._mcx.actual_positions
+        actual_j_phy = _to_phy(actual_j_mcx)
+        p_cur = np.array(forward_kinematics(actual_j_phy)[-1])
+        phi   = actual_j_phy[1] + actual_j_phy[2] + actual_j_phy[3]
+        with self._lock:
+            self._last_cmd_pos = list(actual_j_mcx)
+
+        p_start = np.array([p_cur[0] + MOVEL_STEP_X, p_cur[1], p_cur[2]])
+        p_peak  = np.array([p_cur[0],                 p_cur[1], p_cur[2] + MOVEL_STEP_H])
+        p_end   = np.array([p_cur[0] - MOVEL_STEP_X, p_cur[1], p_cur[2]])
+
+        ctrl_pts  = [p_cur, p_start, p_peak, p_end]
+        chord     = sum(np.linalg.norm(ctrl_pts[i + 1] - ctrl_pts[i])
+                        for i in range(len(ctrl_pts) - 1))
+        dt        = self.traj_dt
+        n         = max(10, int(chord / (MOVEL_VEL * dt)))
+        bezier_pts = _bezier_curve(ctrl_pts, n)
+
+        dense_j = self._ik_trajectory(bezier_pts, phi, actual_j_phy, log_cb=log_cb, label='gait')
+
+        if log_cb:
+            log_cb(
+                f'gait step (φ={math.degrees(phi):.1f}°): '
+                f'{n}pts / chord={chord*1e3:.1f}mm / dt={dt*1e3:.1f}ms'
+            )
+
+        self._send_cst(dense_j, dt, 'gait', cartesian_refs=bezier_pts, log_cb=log_cb)
 
     # ── 궤적 실행 공통 내부 함수 ──────────────────────────────────────────────
     def load_trajectory(self) -> list:
@@ -888,16 +935,17 @@ class MotionController:
         self._send_cst(dense, dt, 'moveJ', log_cb=log_cb)
 
     # ── moveL ─────────────────────────────────────────────────────────────────
-    def move_l(self, cartesian_waypoints: list, phi: float = None,
-               dt: float = None, log_cb=None):
+    def move_l(self, x_target, phi: float = None, v0=None, vf=None,
+               duration: float = None, dt: float = None, log_cb=None):
         """
-        Cartesian 공간 moveL (Bezier 곡선 보간).
+        Cartesian 공간 quintic polynomial 직선 이동 (blocking).
         forceS 임피던스 적용 여부는 _force_s_active 플래그로 실시간 제어 (_send_cst 내부).
 
-        cartesian_waypoints : list of (Px, Py, Pz) [m] — Bezier 제어점 (현재 위치 제외)
-                              현재 발끝 위치가 P0로 자동 추가되어 (n+1)차 Bezier 생성.
-        phi    : θ2+θ3+θ4 유지 각도 [rad]. None이면 현재 관절값에서 자동 계산.
-        dt     : 전송 주기 [s] (기본 200Hz)
+        x_target  : (Px, Py, Pz) [m] — 발끝 목표 좌표 (힙 원점 기준)
+        phi       : θ2+θ3+θ4 유지 각도 [rad]. None이면 현재 관절값에서 자동 계산.
+        v0, vf    : 시작/끝 발끝 속도 벡터 [m/s] (3,). None이면 0.
+        duration  : 이동 시간 [s]. None이면 거리/MOVEL_VEL로 자동 계산.
+        dt        : 전송 주기 [s] (기본 200Hz)
         """
         dt = dt if dt is not None else self.traj_dt
 
@@ -908,30 +956,36 @@ class MotionController:
         if phi is None:
             phi = current_j_phy[1] + current_j_phy[2] + current_j_phy[3]
 
-        p_cur    = forward_kinematics(current_j_phy)[-1]
-        ctrl_pts = [p_cur] + [np.asarray(wp, dtype=float) for wp in cartesian_waypoints]
+        x0     = np.array(forward_kinematics(current_j_phy)[-1], dtype=float)
+        xf     = np.asarray(x_target, dtype=float)
+        v0_arr = np.zeros(3) if v0 is None else np.asarray(v0, dtype=float)
+        vf_arr = np.zeros(3) if vf is None else np.asarray(vf, dtype=float)
 
-        chord = sum(np.linalg.norm(ctrl_pts[i + 1] - ctrl_pts[i])
-                    for i in range(len(ctrl_pts) - 1))
-        n = max(10, int(chord / (MOVEL_VEL * dt)))
+        dist = float(np.linalg.norm(xf - x0))
+        if duration is None:
+            duration = max(dist / MOVEL_VEL, 3 * dt)
 
-        bezier_pts = _bezier_curve(ctrl_pts, n)
-        dense_j    = []
-        prev_phy   = current_j_phy
-        for pt in bezier_pts:
-            result_phy = analytical_ik(pt[0], pt[1], pt[2], phi)
-            if result_phy is None:
-                if log_cb:
-                    log_cb(f'moveL IK 실패: pt=({pt[0]*1e3:.1f},{pt[1]*1e3:.1f},{pt[2]*1e3:.1f})mm')
-                result_phy = prev_phy
-            prev_phy = result_phy
-            dense_j.append(_to_mcx(result_phy))
+        # 각 축 독립 quintic 계수 (3, 6)
+        coeffs = np.array([
+            _quintic_coeffs(0, duration, x0[i], v0_arr[i], 0.0, xf[i], vf_arr[i], 0.0)
+            for i in range(3)
+        ])
+
+        n        = max(1, int(round(duration / dt)))
+        t_arr    = np.linspace(0, duration, n + 1)[1:]   # t=0 제외, t[-1]=duration
+        T_pow    = np.column_stack([t_arr**k for k in range(6)])   # (n, 6)
+        cart_pts = list(T_pow @ coeffs.T)                           # list of (3,) ndarray
+
+        dense_j = self._ik_trajectory(cart_pts, phi, current_j_phy, log_cb=log_cb, label='moveL')
 
         if log_cb:
-            log_cb(f'moveL: {n}pts / chord={chord*1e3:.1f}mm / dt={dt*1e3:.1f}ms')
+            log_cb(
+                f'moveL(quintic): {n}pts / dist={dist*1e3:.1f}mm'
+                f' / T={duration:.2f}s / dt={dt*1e3:.1f}ms'
+            )
 
-        # bezier_pts를 cartesian_refs로 전달 — _send_cst가 forceS 실시간 체크
-        self._send_cst(dense_j, dt, 'moveL', cartesian_refs=bezier_pts, log_cb=log_cb)
+        # cart_pts를 cartesian_refs로 전달 — _send_cst가 forceS 실시간 체크
+        self._send_cst(dense_j, dt, 'moveL', cartesian_refs=cart_pts, log_cb=log_cb)
 
     # ── 홈 복귀 궤적 ─────────────────────────────────────────────────────────────
     def move_to_home(self, max_vel: float = HOME_MAX_VEL,
